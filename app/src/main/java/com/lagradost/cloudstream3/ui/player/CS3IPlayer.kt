@@ -45,7 +45,6 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DecoderCounters
 import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultLivePlaybackSpeedControl
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.audio.DefaultAudioSink
@@ -140,6 +139,8 @@ const val toleranceAfterUs = 300_000L
 class CS3IPlayer : IPlayer {
     private var playerListener: Player.Listener? = null
     private var isPlaying = false
+    private var activeLoadControl: ProactiveLoadControl? = null
+
     private var exoPlayer: ExoPlayer? = null
         set(value) {
             // If the old value is not null then the player has not been properly released.
@@ -607,6 +608,8 @@ class CS3IPlayer : IPlayer {
 
         currentTextRenderer = null
         currentSubtitleDecoder = null
+        activeLoadControl?.playbackState = Player.STATE_IDLE
+        activeLoadControl = null
 
         exoPlayer?.apply {
             playWhenReady = false
@@ -964,6 +967,7 @@ class CS3IPlayer : IPlayer {
                             exoPlayer?.addListener(object : Player.Listener {
                                 private var seekApplied = false
                                 override fun onPlaybackStateChanged(playbackState: Int) {
+                                    activeLoadControl?.playbackState = playbackState
                                     if (seekApplied || playbackState != Player.STATE_READY) return
                                     seekApplied = true
                                     exoPlayer?.seekTo(currentWindow, seekPosition)
@@ -1260,28 +1264,11 @@ class CS3IPlayer : IPlayer {
                 // Allows any seeking to be +- 0.3s to allow for faster seeking
                 .setSeekParameters(SeekParameters(toleranceBeforeUs, toleranceAfterUs))
                 .setLoadControl(
-                    DefaultLoadControl.Builder()
-                        .setTargetBufferBytes(
-                            if (cacheSize <= 0) {
-                                DefaultLoadControl.DEFAULT_TARGET_BUFFER_BYTES
-                            } else {
-                                if (cacheSize > Int.MAX_VALUE) Int.MAX_VALUE else cacheSize.toInt()
-                            }
-                        )
-                        .setBackBuffer(
-                            30000,
-                            true
-                        )
-                        .setBufferDurationsMs(
-                            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                            if (videoBufferMs <= 0) {
-                                DefaultLoadControl.DEFAULT_MAX_BUFFER_MS
-                            } else {
-                                videoBufferMs.toInt()
-                            },
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
-                        ).build()
+                    ProactiveLoadControl.create(
+                        context = context,
+                        videoBufferMs = videoBufferMs,
+                        targetBufferBytes = cacheSize,
+                    ).also { activeLoadControl = it }
                 )
 
         // Because "Java rules" the media3 team hates to do open classes so we have to copy paste the entire thing to add a custom extractor
@@ -1456,6 +1443,8 @@ class CS3IPlayer : IPlayer {
 
             event(PlayerAttachedEvent(exoPlayer))
             exoPlayer?.prepare()
+            activeLoadControl?.playbackState =
+                exoPlayer?.playbackState ?: Player.STATE_IDLE
 
             // For offline fragmented MP4s, FLAG_MERGE_FRAGMENTED_SIDX builds the SIDX seek map
             // incrementally as data is buffered. The initial seek resolves to the nearest merged
@@ -1466,6 +1455,7 @@ class CS3IPlayer : IPlayer {
                 exoPlayer?.addListener(object : Player.Listener {
                     private var seekApplied = false
                     override fun onPlaybackStateChanged(playbackState: Int) {
+                        activeLoadControl?.playbackState = playbackState
                         if (seekApplied || playbackState != Player.STATE_READY) return
                         seekApplied = true
                         exoPlayer?.seekTo(currentWindow, playbackPosition)
@@ -1533,6 +1523,7 @@ class CS3IPlayer : IPlayer {
                 // fixme: Use onPlaybackStateChanged(int) and onPlayWhenReadyChanged(boolean, int) instead.
                 @Suppress("OVERRIDE_DEPRECATION")
                 override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) {
+                    activeLoadControl?.playbackState = playbackState
                     exoPlayer?.let { exo ->
                         event(
                             StatusEvent(
@@ -1635,6 +1626,7 @@ class CS3IPlayer : IPlayer {
 
                 override fun onPlaybackStateChanged(playbackState: Int) {
                     super.onPlaybackStateChanged(playbackState)
+                    activeLoadControl?.playbackState = playbackState
                     when (playbackState) {
                         Player.STATE_READY -> {
 
