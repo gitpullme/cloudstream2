@@ -152,7 +152,9 @@ class PlaybackNetworkMonitor : TransferListener {
             if (bytes < MIN_SAMPLE_BYTES || totalMs < MIN_SAMPLE_MS) {
                 return
             }
-            val bps = (bytes.toDouble() * 1_000.0 / bodyMs.toDouble())
+            // Internally measured in bytes/second, converted to bits/second so it matches
+            // Media3's Format.bitrate (also bits/second) in the buffer policy.
+            val bps = (bytes.toDouble() * 8_000.0 / bodyMs.toDouble())
                 .coerceAtLeast(1.0)
                 .coerceAtMost(MAX_TRUSTED_BPS)
             if (samples == 0) {
@@ -194,7 +196,7 @@ class PlaybackNetworkMonitor : TransferListener {
                     "net end bytes=${snapshot.bytes} dur=${snapshot.totalMs}ms " +
                         "ttfb=${snapshot.ttfbMs}ms headers=${snapshot.headerWaitMs}ms " +
                         "gap=${if (snapshot.gapMs >= 0L) "${snapshot.gapMs}ms" else "first"} " +
-                        "rate=${snapshot.bps}B/s ewma=${snapshot.ewmaBps}B/s " +
+                        "rate=${snapshot.bps}bps ewma=${snapshot.ewmaBps}bps " +
                         "samples=${snapshot.samples} uri=${shortUri(dataSpec.uri.toString())}"
                 )
             }
@@ -236,7 +238,7 @@ class PlaybackNetworkMonitor : TransferListener {
         private const val EWMA_ALPHA = 0.25
         private const val MIN_SAMPLE_BYTES = 32L * 1024L
         private const val MIN_SAMPLE_MS = 100L
-        private const val MAX_TRUSTED_BPS = 1_000_000_000.0 // 1 GB/s sanity cap
+        private const val MAX_TRUSTED_BPS = 1_000_000_000.0 // 1 Gbps sanity cap
         private const val LOG_INTERVAL_MS = 2_000L
 
         private fun shortUri(uri: String): String =

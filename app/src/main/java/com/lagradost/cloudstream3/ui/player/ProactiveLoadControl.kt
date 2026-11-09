@@ -415,7 +415,7 @@ class ProactiveLoadControl private constructor(
                 "resolution=${state.videoWidth}x${state.videoHeight} " +
                 "mime=${state.selectedMime ?: "unknown"} " +
                 "consumption=${decision.consumptionBps}bps " +
-                "thr=${decision.throughputBps}B/s peak=${network.peakThroughputBps}B/s " +
+                "thr=${decision.throughputBps}bps peak=${network.peakThroughputBps}bps " +
                 "var=${"%.2f".format(network.throughputVariation)} " +
                 "ttfb=${network.startupLatencyMs}ms xfer=${network.lastTransferMs}ms " +
                 "etaRefill=${decision.timeToRefillMs}ms " +

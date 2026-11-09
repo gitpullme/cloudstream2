@@ -128,9 +128,9 @@ object ForwardBufferPolicy {
      * the policy never reacts to a single unusually fast or slow sample.
      */
     data class NetworkStats(
-        /** Exponentially weighted transfer rate in bytes/second, or 0 when unknown. */
+        /** Exponentially weighted transfer rate in bits/second, or 0 when unknown. */
         val throughputBps: Long = 0L,
-        /** Highest recent smoothed rate, for diagnostics only. */
+        /** Highest recent smoothed rate in bits/second, for diagnostics only. */
         val peakThroughputBps: Long = 0L,
         /** Coefficient of variation (standard deviation / mean) of recent samples, 0..1. */
         val throughputVariation: Float = 0f,
