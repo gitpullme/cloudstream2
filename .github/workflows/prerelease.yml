@@ -21,11 +21,14 @@ jobs:
     steps:
     - name: Generate access token
       id: generate_token
+      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
         private_key: ${{ secrets.GH_APP_KEY }}
-        repository: "recloudstream/secrets"
+        installation_retrieval_mode: repository
+        installation_retrieval_payload: "recloudstream/secrets"
+        repositories: '["recloudstream/secrets"]'
 
     - uses: actions/checkout@v6
 
@@ -40,6 +43,7 @@ jobs:
 
     - name: Fetch keystore
       id: fetch_keystore
+      if: ${{ steps.generate_token.outputs.token != '' }}
       run: |
         TMP_KEYSTORE_FILE_PATH="${RUNNER_TEMP}"/keystore
         mkdir -p "${TMP_KEYSTORE_FILE_PATH}"
@@ -57,7 +61,7 @@ jobs:
     - name: Run Gradle
       run: ./gradlew assemblePrereleaseRelease androidSourcesJar makeJar
       env:
-        SIGNING_KEY_ALIAS: "key0"
+        SIGNING_KEY_ALIAS: ${{ steps.fetch_keystore.outputs.key_pwd != '' && 'key0' || '' }}
         SIGNING_KEY_PASSWORD: ${{ steps.fetch_keystore.outputs.key_pwd }}
         SIGNING_STORE_PASSWORD: ${{ steps.fetch_keystore.outputs.key_pwd }}
         SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}

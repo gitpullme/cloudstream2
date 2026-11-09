@@ -58,6 +58,7 @@ class ProactiveLoadControl private constructor(
         var videoHeight: Int = 0,
         var selectedMime: String? = null,
         var lastForwardMs: Long = 0L,
+        var playbackState: Int = Player.STATE_IDLE,
     )
 
     private val states = ConcurrentHashMap<PlayerId, PlayerState>()
@@ -95,11 +96,28 @@ class ProactiveLoadControl private constructor(
 
     /**
      * Current ExoPlayer playback state, mirrored by CS3IPlayer for diagnostics and for the policy's
-     * end-of-stream guard. Do not use IDLE as "not playing": during prepare the mirror can still be
-     * IDLE while the initial load must be allowed to start.
+     * end-of-stream guard. Isolated per player instance in [PlayerState].
      */
     @Volatile
     var playbackState: Int = Player.STATE_IDLE
+        set(value) {
+            field = value
+            for (s in states.values) {
+                synchronized(s) {
+                    s.playbackState = value
+                }
+            }
+        }
+
+    fun setPlaybackState(playerId: PlayerId, state: Int) {
+        states[playerId]?.let { s ->
+            synchronized(s) {
+                s.playbackState = state
+            }
+        }
+    }
+
+    fun isLiveStream(): Boolean = states.values.any { it.plan.isLive }
 
     @Volatile
     private var memoryPressureUntilMs: Long = 0L
@@ -159,7 +177,6 @@ class ProactiveLoadControl private constructor(
             state.videoHeight = trackInfo.height
             state.selectedMime = trackInfo.mime
         }
-        PlaybackCacheManager.setSourceLive(isLive)
         logPlan("tracks selected", state.plan)
     }
 
@@ -169,19 +186,19 @@ class ProactiveLoadControl private constructor(
             ForwardBufferPolicy.createPlan(config, isLive = false, selectedBitrateBps = 0L)
         ).also { states[playerId] = it }
 
-        // Progressive live streams can only be classified after preparation, when the extractor
-        // discovers an unknown duration. The check is throttled because this method is called on
-        // every playback-loop tick while the buffer is full.
-        val liveDiscovered = synchronized(state) {
+        // Live state changes, dynamic sliding playlists and progressive live streams are tracked
+        // per player instance without mutating global disk-cache bypass for other players.
+        val isLiveNow = parameters.isLive()
+        val liveStateChanged = synchronized(state) {
             val now = SystemClock.elapsedRealtime()
-            if (!state.plan.isLive &&
+            if (isLiveNow != state.plan.isLive ||
                 now - state.lastLiveCheckRealtimeMs >= LIVE_CHECK_INTERVAL_MS
             ) {
                 state.lastLiveCheckRealtimeMs = now
-                if (parameters.isLive()) {
+                if (isLiveNow != state.plan.isLive) {
                     state.plan = ForwardBufferPolicy.createPlan(
                         config = config,
-                        isLive = true,
+                        isLive = isLiveNow,
                         selectedBitrateBps = state.plan.selectedBitrateBps,
                     )
                     true
@@ -192,9 +209,8 @@ class ProactiveLoadControl private constructor(
                 false
             }
         }
-        if (liveDiscovered) {
-            PlaybackCacheManager.setSourceLive(true)
-            logPlan("live discovered", state.plan)
+        if (liveStateChanged) {
+            logPlan("live state changed isLive=$isLiveNow", state.plan)
         }
 
         val allocatedBytes = try {
@@ -224,7 +240,7 @@ class ProactiveLoadControl private constructor(
                 allocatedBytes = allocatedBytes,
                 playbackSpeed = parameters.playbackSpeed,
                 network = network,
-                playbackState = playbackState,
+                playbackState = state.playbackState,
                 playWhenReady = parameters.playWhenReady,
                 rebuffering = parameters.rebuffering,
                 memoryPressure = memoryPressure,
@@ -318,7 +334,8 @@ class ProactiveLoadControl private constructor(
             if (timeline.isEmpty) return false
             val period = Timeline.Period()
             timeline.getPeriodByUid(mediaPeriodId.periodUid, period)
-            timeline.getWindow(period.windowIndex, Timeline.Window()).isDynamic
+            val window = timeline.getWindow(period.windowIndex, Timeline.Window())
+            window.isDynamic || window.isLive() || window.durationUs == C.TIME_UNSET
         } catch (_: Throwable) {
             false
         }

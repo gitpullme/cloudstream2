@@ -2,6 +2,7 @@ package com.lagradost.cloudstream3.ui.player
 
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
@@ -10,8 +11,10 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.cache.CacheKeyFactory
 import com.lagradost.cloudstream3.BuildConfig
+import java.security.MessageDigest
 import java.util.IdentityHashMap
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -25,13 +28,16 @@ import kotlin.math.sqrt
  * subtitle fetch or one unusually fast segment cannot swing the adaptive policy.
  */
 @OptIn(UnstableApi::class)
-class PlaybackNetworkMonitor : TransferListener {
+class PlaybackNetworkMonitor(
+    private val clock: () -> Long = { SystemClock.elapsedRealtime() }
+) : TransferListener {
     private class RequestState(
         val initRealtimeMs: Long,
         val gapSincePreviousEndMs: Long,
     ) {
         var startRealtimeMs: Long = 0L
         var firstByteRealtimeMs: Long = 0L
+        var lastByteRealtimeMs: Long = 0L
         var bytes: Long = 0L
     }
 
@@ -42,11 +48,13 @@ class PlaybackNetworkMonitor : TransferListener {
     private var variance = 0.0
     private var peakBps = 0L
     private var startupEwmaMs = 0.0
-    private var lastTransferEwmaMs = 0.0
+    private var lastSchedulingGapEwmaMs = 0.0
+    private var bodyTransferEwmaMs = 0.0
     private var samples = 0
     private var lastLogRealtimeMs = 0L
     private var lastPhaseLogRealtimeMs = 0L
     private var lastTransferEndRealtimeMs = 0L
+    private var lastUsefulTransferRealtimeMs = 0L
 
     fun reset() {
         synchronized(lock) {
@@ -55,18 +63,35 @@ class PlaybackNetworkMonitor : TransferListener {
             variance = 0.0
             peakBps = 0L
             startupEwmaMs = 0.0
-            lastTransferEwmaMs = 0.0
+            lastSchedulingGapEwmaMs = 0.0
+            bodyTransferEwmaMs = 0.0
             samples = 0
             lastLogRealtimeMs = 0L
             lastPhaseLogRealtimeMs = 0L
             lastTransferEndRealtimeMs = 0L
+            lastUsefulTransferRealtimeMs = 0L
         }
     }
 
     override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
         if (!isNetwork) return
-        val now = SystemClock.elapsedRealtime()
+        val now = clock()
         synchronized(lock) {
+            // Prune abandoned or timed out requests to avoid unbounded accumulation
+            if (requests.size >= MAX_CONCURRENT_REQUESTS) {
+                val iterator = requests.entries.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    if (now - entry.value.initRealtimeMs > REQUEST_TIMEOUT_MS) {
+                        iterator.remove()
+                    }
+                }
+                if (requests.size >= MAX_CONCURRENT_REQUESTS) {
+                    val oldest = requests.minByOrNull { it.value.initRealtimeMs }
+                    if (oldest != null) requests.remove(oldest.key)
+                }
+            }
+
             val gap = if (lastTransferEndRealtimeMs > 0L) {
                 (now - lastTransferEndRealtimeMs).coerceAtLeast(0L)
             } else {
@@ -85,7 +110,7 @@ class PlaybackNetworkMonitor : TransferListener {
 
     override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
         if (!isNetwork) return
-        val now = SystemClock.elapsedRealtime()
+        val now = clock()
         synchronized(lock) {
             val state = requests[source] ?: RequestState(now, -1L)
                 .also { requests[source] = it }
@@ -107,7 +132,7 @@ class PlaybackNetworkMonitor : TransferListener {
         bytesTransferred: Int,
     ) {
         if (!isNetwork || bytesTransferred <= 0) return
-        val now = SystemClock.elapsedRealtime()
+        val now = clock()
         synchronized(lock) {
             val state = requests[source] ?: RequestState(now, -1L)
                 .also { requests[source] = it }
@@ -123,7 +148,9 @@ class PlaybackNetworkMonitor : TransferListener {
                     )
                 }
             }
+            state.lastByteRealtimeMs = now
             state.bytes += bytesTransferred.toLong()
+            lastUsefulTransferRealtimeMs = now
         }
     }
 
@@ -132,7 +159,7 @@ class PlaybackNetworkMonitor : TransferListener {
         val snapshot: RequestResult?
         synchronized(lock) {
             val state = requests.remove(source) ?: return
-            val now = SystemClock.elapsedRealtime()
+            val now = clock()
             if (state.startRealtimeMs == 0L) state.startRealtimeMs = now
             lastTransferEndRealtimeMs = now
 
@@ -154,8 +181,9 @@ class PlaybackNetworkMonitor : TransferListener {
             if (bytes < MIN_SAMPLE_BYTES || totalMs < MIN_SAMPLE_MS) {
                 return
             }
-            // Internally measured in bytes/second, converted to bits/second so it matches
-            // Media3's Format.bitrate (also bits/second) in the buffer policy.
+            lastUsefulTransferRealtimeMs = now
+
+            // Internally measured in bits/second consistently, matching Media3 Format.bitrate
             val bps = (bytes.toDouble() * 8_000.0 / bodyMs.toDouble())
                 .coerceAtLeast(1.0)
                 .coerceAtMost(MAX_TRUSTED_BPS)
@@ -174,11 +202,21 @@ class PlaybackNetworkMonitor : TransferListener {
             } else {
                 EWMA_ALPHA * ttfbMs + (1.0 - EWMA_ALPHA) * startupEwmaMs
             }
-            lastTransferEwmaMs = if (lastTransferEwmaMs <= 0.0) {
-                totalMs.toDouble()
-            } else {
-                EWMA_ALPHA * totalMs + (1.0 - EWMA_ALPHA) * lastTransferEwmaMs
+
+            if (state.gapSincePreviousEndMs >= 0L) {
+                lastSchedulingGapEwmaMs = if (lastSchedulingGapEwmaMs <= 0.0) {
+                    state.gapSincePreviousEndMs.toDouble()
+                } else {
+                    EWMA_ALPHA * state.gapSincePreviousEndMs + (1.0 - EWMA_ALPHA) * lastSchedulingGapEwmaMs
+                }
             }
+
+            bodyTransferEwmaMs = if (bodyTransferEwmaMs <= 0.0) {
+                bodyMs.toDouble()
+            } else {
+                EWMA_ALPHA * bodyMs + (1.0 - EWMA_ALPHA) * bodyTransferEwmaMs
+            }
+
             samples += 1
             snapshot = RequestResult(
                 bytes = bytes,
@@ -190,7 +228,7 @@ class PlaybackNetworkMonitor : TransferListener {
                 ewmaBps = ewmaBps.toLong(),
                 samples = samples,
             )
-            val nowRealtime = SystemClock.elapsedRealtime()
+            val nowRealtime = clock()
             if (BuildConfig.DEBUG && nowRealtime - lastLogRealtimeMs >= LOG_INTERVAL_MS) {
                 lastLogRealtimeMs = nowRealtime
                 Log.d(
@@ -207,19 +245,61 @@ class PlaybackNetworkMonitor : TransferListener {
 
     /** Returns a thread-safe immutable snapshot for the load policy. */
     fun snapshot(): ForwardBufferPolicy.NetworkStats {
+        val now = clock()
         synchronized(lock) {
-            val variation = if (samples >= 3 && ewmaBps > 1.0) {
-                (sqrt(variance) / ewmaBps).coerceIn(0.0, 1.0).toFloat()
+            val timeSinceUseful = if (lastUsefulTransferRealtimeMs > 0L) {
+                (now - lastUsefulTransferRealtimeMs).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+
+            // Freshness / Staleness detection: decay old samples if the connection went idle
+            val isStale = lastUsefulTransferRealtimeMs > 0L && timeSinceUseful > STALE_SAMPLE_TIMEOUT_MS
+            val decay = if (isStale) {
+                val staleIntervals = (timeSinceUseful - STALE_SAMPLE_TIMEOUT_MS) / STALE_SAMPLE_TIMEOUT_MS
+                (1.0 / (1.0 + 0.5 * (staleIntervals + 1))).coerceIn(0.1, 1.0)
+            } else {
+                1.0
+            }
+
+            var currentEwma = ewmaBps * decay
+            var currentPeak = (peakBps * decay).toLong().coerceAtLeast(currentEwma.toLong())
+
+            // Distinguish an active but stalled request from completed fast transfers
+            for (req in requests.values) {
+                if (req.startRealtimeMs > 0L) {
+                    val inFlightMs = (now - req.startRealtimeMs).coerceAtLeast(1L)
+                    val idleMs = now - (if (req.lastByteRealtimeMs > 0L) req.lastByteRealtimeMs else req.startRealtimeMs)
+                    if (idleMs >= STALL_IDLE_MS || inFlightMs >= STALL_DURATION_MS) {
+                        val inFlightBps = (req.bytes.toDouble() * 8_000.0 / inFlightMs)
+                        if (inFlightBps < currentEwma) {
+                            currentEwma = inFlightBps
+                            currentPeak = min(currentPeak, max(inFlightBps.toLong(), 1L))
+                        }
+                    }
+                }
+            }
+
+            val variation = if (samples >= 3 && currentEwma > 1.0) {
+                (sqrt(variance) / currentEwma).coerceIn(0.0, 1.0).toFloat()
             } else {
                 0f
             }
+
+            // Use scheduling gap (inter-request gap) separately from body transfer duration
+            val schedulingGap = if (lastSchedulingGapEwmaMs > 0.0) {
+                lastSchedulingGapEwmaMs.toLong()
+            } else {
+                0L
+            }
+
             return ForwardBufferPolicy.NetworkStats(
-                throughputBps = if (samples > 0) ewmaBps.toLong() else 0L,
-                peakThroughputBps = peakBps,
+                throughputBps = if (samples > 0) currentEwma.toLong() else 0L,
+                peakThroughputBps = currentPeak,
                 throughputVariation = variation,
                 startupLatencyMs = startupEwmaMs.toLong(),
-                lastTransferMs = lastTransferEwmaMs.toLong(),
-                samples = samples,
+                lastTransferMs = schedulingGap,
+                samples = if (isStale) max(1, samples / 2) else samples,
             )
         }
     }
@@ -249,6 +329,11 @@ class PlaybackNetworkMonitor : TransferListener {
         private const val MIN_SAMPLE_MS = 100L
         private const val MAX_TRUSTED_BPS = 1_000_000_000.0 // 1 Gbps sanity cap
         private const val LOG_INTERVAL_MS = 2_000L
+        private const val MAX_CONCURRENT_REQUESTS = 64
+        private const val REQUEST_TIMEOUT_MS = 60_000L
+        private const val STALE_SAMPLE_TIMEOUT_MS = 15_000L
+        private const val STALL_IDLE_MS = 2_500L
+        private const val STALL_DURATION_MS = 3_000L
 
         private fun shortUri(uri: String): String =
             if (uri.length <= 120) uri else uri.substring(0, 117) + "..."
@@ -284,10 +369,10 @@ class InstrumentedHttpDataSourceFactory(
  * Cache key that keeps request headers that change the bytes returned by the server.
  *
  * The default Media3 key is only the URI. Two requests for the same URI with different
- * Authorization/Referer/Cookie headers could therefore reuse the wrong cached payload. The
- * factory also receives the data source's default request headers, because providers in
- * CloudStream set most auth headers there rather than on the [DataSpec]. Ranges and positions are
- * deliberately not part of the key (they identify the same resource).
+ * Authorization/Referer/Cookie headers could therefore reuse the wrong cached payload.
+ *
+ * Sensitive headers (e.g. authorization tokens and cookies) are hashed to protect user
+ * credentials from being stored in plaintext on disk or in cache databases.
  */
 @OptIn(UnstableApi::class)
 class HeaderAwareCacheKeyFactory(
@@ -313,9 +398,19 @@ class HeaderAwareCacheKeyFactory(
             if (lower in headerWhitelist) relevant[lower] = value
         }
         if (relevant.isEmpty()) return base
-        val fingerprint = relevant.entries
+
+        val rawFingerprint = relevant.entries
             .sortedBy { it.key }
             .joinToString("&") { "${it.key}=${it.value}" }
-        return "$base|$fingerprint"
+
+        val hash = try {
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(rawFingerprint.toByteArray(Charsets.UTF_8))
+            digest.joinToString("") { "%02x".format(it) }.take(16)
+        } catch (_: Throwable) {
+            rawFingerprint.hashCode().toString()
+        }
+
+        return "$base|h=$hash"
     }
 }

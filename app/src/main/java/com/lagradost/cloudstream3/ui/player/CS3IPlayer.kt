@@ -1305,7 +1305,9 @@ class CS3IPlayer : IPlayer {
                 CacheRoutingDataSourceFactory(
                     cacheFactory = cacheFactory,
                     upstreamFactory = upstream,
-                    shouldBypass = PlaybackCacheManager::shouldBypassCache,
+                    shouldBypass = { uri ->
+                        (loadControl?.isLiveStream() == true) || PlaybackCacheManager.shouldBypassCache(uri)
+                    },
                 )
             }
         }

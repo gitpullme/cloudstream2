@@ -5,6 +5,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
+import java.io.IOException
 
 /**
  * Routes each request either through the disk cache or directly upstream.
@@ -12,7 +13,7 @@ import androidx.media3.datasource.TransferListener
  * A single [androidx.media3.datasource.cache.CacheDataSource.Factory] is shared by manifests and
  * media segments. Caching an HLS/DASH manifest is harmful: a live playlist reload would be served
  * from disk with the old media sequence and freeze the live edge. The cache manager therefore marks
- * `.m3u8`/`.mpd` resources (and every request of a source already known to be live) as bypassed.
+ * manifests (and every request of a source already known to be live) as bypassed.
  *
  * The decision is made per [DataSource.open], because one ExoPlayer media source can request both
  * manifests and segments through the same factory.
@@ -39,19 +40,27 @@ class CacheRoutingDataSourceFactory(
         private var delegate: DataSource? = null
 
         override fun addTransferListener(transferListener: TransferListener) {
-            listeners += transferListener
+            if (!listeners.contains(transferListener)) {
+                listeners += transferListener
+            }
             delegate?.addTransferListener(transferListener)
         }
 
         override fun open(dataSpec: DataSpec): Long {
-            delegate?.close()
-            // Only GET responses are cacheable. DRM license requests are POSTs and must never be
-            // served from (or written to) the media cache. HLS/DASH manifests and encryption keys
-            // request gzip and must always be re-fetched; an extensionless live playlist would
-            // otherwise freeze on the cached live edge.
+            // Ensure any previous delegate is closed cleanly before a repeated open.
+            runCatching { delegate?.close() }
+            delegate = null
+
+            // Register this resource with active playback protection.
+            val cacheKey = dataSpec.key ?: dataSpec.uri.toString()
+            PlaybackCacheManager.registerActiveKey(cacheKey, dataSpec.uri)
+
+            // Only GET responses are cacheable. DRM license requests and analytics are POSTs
+            // and must never be served from (or written to) the media cache.
+            // Do not assume gzip flags mean a manifest: media chunks may also negotiate gzip.
             val bypass = dataSpec.httpMethod != DataSpec.HTTP_METHOD_GET ||
-                dataSpec.isFlagSet(DataSpec.FLAG_ALLOW_GZIP) ||
                 shouldBypass(dataSpec.uri)
+
             val source = if (bypass) {
                 upstreamFactory.createDataSource()
             } else {
@@ -59,11 +68,17 @@ class CacheRoutingDataSourceFactory(
             }
             listeners.forEach { source.addTransferListener(it) }
             delegate = source
-            return source.open(dataSpec)
+
+            return try {
+                source.open(dataSpec)
+            } catch (e: Exception) {
+                // Media3 requires close() even if open() throws an exception; keep delegate assigned.
+                throw if (e is IOException) e else IOException("Failed to open DataSource", e)
+            }
         }
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-            val source = delegate ?: error("read() called before open()")
+            val source = delegate ?: throw IOException("read() called before open()")
             return source.read(buffer, offset, length)
         }
 
@@ -73,9 +88,9 @@ class CacheRoutingDataSourceFactory(
             delegate?.responseHeaders ?: emptyMap()
 
         override fun close() {
-            val source = delegate ?: return
+            val source = delegate
             delegate = null
-            source.close()
+            source?.close()
         }
     }
 }

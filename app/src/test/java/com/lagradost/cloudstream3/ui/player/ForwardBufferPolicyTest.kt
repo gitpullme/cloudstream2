@@ -38,6 +38,7 @@ class ForwardBufferPolicyTest {
         speed: Float = 1f,
         network: ForwardBufferPolicy.NetworkStats = ForwardBufferPolicy.NetworkStats(),
         playbackState: Int = 3,
+        playWhenReady: Boolean = true,
         rebuffering: Boolean = false,
         memoryPressure: Boolean = false,
     ) = ForwardBufferPolicy.decide(
@@ -48,6 +49,7 @@ class ForwardBufferPolicyTest {
         playbackSpeed = speed,
         network = network,
         playbackState = playbackState,
+        playWhenReady = playWhenReady,
         rebuffering = rebuffering,
         memoryPressure = memoryPressure,
     )
@@ -483,9 +485,47 @@ class ForwardBufferPolicyTest {
     fun `paused prefetch fills to the same target but never beyond it`() {
         val plan = createPlan()
 
-        assertTrue(decide(plan, loading = true, bufferedMs = 60_000L).isLoading)
-        assertFalse(decide(plan, loading = true, bufferedMs = 120_000L).isLoading)
-        assertTrue(decide(plan, loading = false, bufferedMs = 60_000L).isLoading)
+        assertTrue(decide(plan, loading = true, bufferedMs = 60_000L, playWhenReady = false).isLoading)
+        assertFalse(decide(plan, loading = true, bufferedMs = 120_000L, playWhenReady = false).isLoading)
+        assertTrue(decide(plan, loading = false, bufferedMs = 60_000L, playWhenReady = false).isLoading)
+        assertFalse(decide(plan, loading = false, bufferedMs = 95_000L, playWhenReady = false).isLoading)
+    }
+
+    @Test
+    fun `paused live streams cap forward buffer and stop loading at live limit`() {
+        val livePlan = createPlan(live = true)
+        assertEquals(ForwardBufferPolicy.LIVE_MAX_BUFFER_MS, livePlan.targetMs)
+
+        // Below live target while loading -> continues
+        assertTrue(decide(livePlan, loading = true, bufferedMs = 30_000L, playWhenReady = false).isLoading)
+
+        // At live target while loading -> stops
+        assertFalse(decide(livePlan, loading = true, bufferedMs = 50_000L, playWhenReady = false).isLoading)
+
+        // Above live target -> stops
+        assertFalse(decide(livePlan, loading = false, bufferedMs = 50_001L, playWhenReady = false).isLoading)
+    }
+
+    @Test
+    fun `live state changes and dynamic progressive streams adjust plan targets`() {
+        val vodPlan = createPlan(bufferMs = 120_000L, live = false)
+        assertEquals(120_000L, vodPlan.targetMs)
+
+        // Transition to live caps target
+        val livePlan = ForwardBufferPolicy.createPlan(
+            config = ForwardBufferPolicy.Config(requestedBufferMs = 120_000L, requestedRamBytes = 0L, lowRamDevice = false),
+            isLive = true,
+            selectedBitrateBps = vodPlan.selectedBitrateBps,
+        )
+        assertEquals(ForwardBufferPolicy.LIVE_MAX_BUFFER_MS, livePlan.targetMs)
+
+        // Transition back from live to VOD restores target
+        val restoredPlan = ForwardBufferPolicy.createPlan(
+            config = ForwardBufferPolicy.Config(requestedBufferMs = 120_000L, requestedRamBytes = 0L, lowRamDevice = false),
+            isLive = false,
+            selectedBitrateBps = livePlan.selectedBitrateBps,
+        )
+        assertEquals(120_000L, restoredPlan.targetMs)
     }
 
     @Test

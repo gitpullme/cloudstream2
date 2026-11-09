@@ -13,6 +13,7 @@ import androidx.media3.datasource.cache.CacheSpan
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.database.StandaloneDatabaseProvider
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Owns the single process-wide [SimpleCache] used for online playback.
@@ -29,6 +30,8 @@ import java.io.File
  * - The cache persists across app exits.
  * - Recently touched spans and spans belonging to the active media source are protected from
  *   eviction as long as another eligible span exists.
+ * - Spans belonging to the active playback item are protected reliably across multiple CDN domains,
+ *   signed URLs, track variants and query parameters.
  * - Clearing the cache uses Media3's supported per-resource removal instead of deleting files
  *   underneath an open cache.
  */
@@ -51,6 +54,10 @@ object PlaybackCacheManager {
     @Volatile
     private var activePrefix: String? = null
 
+    private val activeKeys = ConcurrentHashMap.newKeySet<String>()
+    private val activeUris = ConcurrentHashMap.newKeySet<String>()
+    private val liveSourceUris = ConcurrentHashMap.newKeySet<String>()
+
     @Volatile
     private var bypassActiveSource = false
 
@@ -63,13 +70,10 @@ object PlaybackCacheManager {
         synchronized(lock) {
             cache?.let { existing ->
                 if (requestedBytes != configuredRequestBytes) {
-                    // The user changed the "Video cache on disk" setting. SimpleCache cannot
-                    // change evictor, but the limit itself is mutable; a smaller limit is
-                    // enforced as soon as the next span is committed or touched.
                     configuredRequestBytes = requestedBytes
                     val newSize = resolveDiskCacheBytes(context, requestedBytes)
                     configuredBytes = newSize
-                    evictor?.setMaxBytes(newSize)
+                    evictor?.setMaxBytes(newSize, existing)
                     Log.i(
                         TAG,
                         "cache size setting changed to ${newSize / (1024 * 1024)}MB"
@@ -128,14 +132,49 @@ object PlaybackCacheManager {
         val prefix = sourceUri?.let { keyPrefix(it, directoryScope) }
         activePrefix = prefix
         bypassActiveSource = false
+        activeKeys.clear()
+        activeUris.clear()
+        sourceUri?.let {
+            activeUris.add(normalizeUri(it))
+        }
         evictor?.setActivePrefix(prefix)
+        evictor?.clearActiveOwnership()
+        sourceUri?.let {
+            evictor?.registerActiveUri(normalizeUri(it))
+        }
         Log.d(TAG, "cache active prefix=${prefix ?: "none"}")
     }
 
     fun clearActiveSource() {
         activePrefix = null
         bypassActiveSource = false
+        activeKeys.clear()
+        activeUris.clear()
         evictor?.setActivePrefix(null)
+        evictor?.clearActiveOwnership()
+    }
+
+    /** Registers a specific cache key or segment URI as owned by the active playback session. */
+    fun registerActiveKey(key: String, uri: Uri? = null) {
+        activeKeys.add(key)
+        uri?.let {
+            activeUris.add(normalizeUri(it.toString()))
+            evictor?.registerActiveUri(normalizeUri(it.toString()))
+        }
+        evictor?.registerActiveKey(key)
+    }
+
+    fun isSpanActive(key: String): Boolean =
+        evictor?.isSpanActive(key) ?: defaultIsSpanActive(key)
+
+    private fun defaultIsSpanActive(key: String): Boolean {
+        if (activeKeys.contains(key)) return true
+        val prefix = activePrefix
+        if (prefix != null && key.startsWith(prefix)) return true
+        val rawUrl = key.substringBefore('|')
+        if (prefix != null && rawUrl.startsWith(prefix)) return true
+        val norm = normalizeUri(rawUrl)
+        return activeUris.contains(norm)
     }
 
     /**
@@ -147,18 +186,43 @@ object PlaybackCacheManager {
         Log.d(TAG, "cache live bypass=$isLive")
     }
 
+    fun setSourceLive(sourceUri: String?, isLive: Boolean) {
+        if (sourceUri == null) return
+        val norm = normalizeUri(sourceUri)
+        if (isLive) {
+            liveSourceUris.add(norm)
+        } else {
+            liveSourceUris.remove(norm)
+        }
+        Log.d(TAG, "cache source live=$isLive uri=$norm")
+    }
+
+    fun isSourceLive(sourceUri: String?): Boolean {
+        if (sourceUri == null) return false
+        return liveSourceUris.contains(normalizeUri(sourceUri))
+    }
+
     /**
      * Returns true for resources that must never be cached: HLS/DASH manifests (a cached live
      * playlist would freeze the live edge) and every request of a source already known to be live.
      */
     fun shouldBypassCache(uri: Uri): Boolean {
         if (bypassActiveSource) return true
+        if (isSourceLive(uri.toString())) return true
+        return isManifest(uri)
+    }
+
+    fun isManifest(uri: Uri): Boolean {
         val path = uri.path?.lowercase() ?: return false
         return path.endsWith(".m3u8") ||
             path.endsWith(".mpd") ||
             path.endsWith(".ism") ||
             path.endsWith(".ismc") ||
-            path.endsWith("/manifest")
+            path.endsWith("/manifest") ||
+            path.endsWith("/master") ||
+            path.endsWith("/playlist") ||
+            path.contains(".m3u8") ||
+            path.contains(".mpd")
     }
 
     fun isBypassingCache(): Boolean = bypassActiveSource
@@ -174,10 +238,9 @@ object PlaybackCacheManager {
         synchronized(lock) {
             val current = cache ?: return 0L
             val before = runCatching { current.cacheSpace }.getOrDefault(0L)
-            val protectedPrefix = activePrefix
             runCatching {
                 current.keys.toList().forEach { key ->
-                    if (!protectedPrefix.isNullOrEmpty() && key.startsWith(protectedPrefix)) {
+                    if (isSpanActive(key)) {
                         return@forEach
                     }
                     runCatching { current.removeResource(key) }
@@ -241,6 +304,16 @@ object PlaybackCacheManager {
         }.getOrDefault(sourceUri)
     }
 
+    /** Normalizes a URI string by stripping query parameters and hash fragments. */
+    fun normalizeUri(uriString: String): String = runCatching {
+        val uri = Uri.parse(uriString)
+        buildString {
+            uri.scheme?.let { append(it).append("://") }
+            (uri.encodedAuthority ?: uri.host)?.let { append(it) }
+            uri.path?.let { append(it) }
+        }
+    }.getOrDefault(uriString.substringBefore('?').substringBefore('#'))
+
     /**
      * LRU evictor that protects recently read spans and the active media source.
      *
@@ -263,18 +336,46 @@ object PlaybackCacheManager {
         private var totalWrittenBytes = 0L
         @Volatile
         private var activePrefix: String? = null
+        private val activeKeys = ConcurrentHashMap.newKeySet<String>()
+        private val activeUris = ConcurrentHashMap.newKeySet<String>()
+        @Volatile
+        private var attachedCache: Cache? = null
 
-        fun setMaxBytes(newMaxBytes: Long) {
-            // Deliberately does not call into SimpleCache while holding this lock: a cache thread
-            // may hold the SimpleCache lock and wait for this lock. The new limit is applied by
-            // the next onSpanAdded/onSpanTouched callback.
+        fun setMaxBytes(newMaxBytes: Long, cache: Cache? = null) {
             maxBytes = newMaxBytes
+            val c = cache ?: attachedCache
+            if (c != null) {
+                evict(c)
+            }
         }
 
         fun setActivePrefix(prefix: String?) {
             synchronized(lock) {
                 activePrefix = prefix?.takeIf { it.isNotBlank() }
             }
+        }
+
+        fun registerActiveKey(key: String) {
+            activeKeys.add(key)
+        }
+
+        fun registerActiveUri(uriNormalized: String) {
+            activeUris.add(uriNormalized)
+        }
+
+        fun clearActiveOwnership() {
+            activeKeys.clear()
+            activeUris.clear()
+        }
+
+        fun isSpanActive(key: String): Boolean {
+            if (activeKeys.contains(key)) return true
+            val prefix = activePrefix
+            if (prefix != null && key.startsWith(prefix)) return true
+            val rawUrl = key.substringBefore('|')
+            if (prefix != null && rawUrl.startsWith(prefix)) return true
+            val norm = normalizeUri(rawUrl)
+            return activeUris.contains(norm)
         }
 
         fun usageBytes(): Long = synchronized(lock) { currentSize }
@@ -284,43 +385,48 @@ object PlaybackCacheManager {
         override fun requiresCacheSpanTouches(): Boolean = true
 
         override fun onCacheInitialized() {
-            // Existing spans were delivered in directory order, not LRU order. Re-sort once so the
-            // eviction order reflects their persisted last-touch timestamps.
             synchronized(lock) {
                 initialized = true
-                if (lru.size <= 1) return
-                val sorted = lru.sortedBy { it.lastTouchTimestamp }
-                lru.clear()
-                lru.addAll(sorted)
+                if (lru.isNotEmpty()) {
+                    val sorted = lru.sortedBy { it.lastTouchTimestamp }
+                    lru.clear()
+                    lru.addAll(sorted)
+                }
             }
+            attachedCache?.let { evict(it) }
         }
 
         override fun onStartFile(cache: Cache, key: String, position: Long, length: Long) {
-            // Deliberately do not pre-evict length bytes. For a file larger than maxBytes the
-            // stock evictor would wipe the whole cache before writing a single byte. onSpanAdded
-            // maintains the budget incrementally instead.
+            attachedCache = cache
         }
 
         override fun onSpanAdded(cache: Cache, span: CacheSpan) {
-            if (!span.isCached) return
+            attachedCache = cache
+            if (!span.isCached || span.length <= 0L) return
             synchronized(lock) {
-                if (initialized && span.length > 0L) totalWrittenBytes += span.length
+                if (initialized) totalWrittenBytes += span.length
                 addLocked(span)
-                evictLocked(cache)
+            }
+            if (initialized) {
+                evict(cache)
             }
         }
 
         override fun onSpanRemoved(cache: Cache, span: CacheSpan) {
+            attachedCache = cache
             synchronized(lock) {
                 removeLocked(span)
             }
         }
 
         override fun onSpanTouched(cache: Cache, oldSpan: CacheSpan, newSpan: CacheSpan) {
+            attachedCache = cache
             synchronized(lock) {
                 removeLocked(oldSpan)
                 addLocked(newSpan)
-                evictLocked(cache)
+            }
+            if (initialized) {
+                evict(cache)
             }
         }
 
@@ -335,36 +441,76 @@ object PlaybackCacheManager {
             }
         }
 
-        private fun evictLocked(cache: Cache) {
-            if (currentSize <= maxBytes) return
-            val now = System.currentTimeMillis()
+        fun evict(cache: Cache) {
+            attachedCache = cache
+            val failedVictims = mutableSetOf<CacheSpan>()
             var evictions = 0
-            while (currentSize > maxBytes && lru.isNotEmpty() && evictions < MAX_EVICTIONS_PER_CALL) {
-                val prefix = activePrefix
-                val victim =
-                    // First: old, unrelated content.
-                    lru.firstOrNull {
-                        prefix != null && !it.key.startsWith(prefix) && !isRecent(it, now)
+            while (evictions < MAX_EVICTIONS_PER_CALL) {
+                val victim: CacheSpan? = synchronized(lock) {
+                    if (currentSize <= maxBytes) return
+                    selectVictimLocked(failedVictims)?.also {
+                        removeLocked(it)
                     }
-                        // Then: any unrelated content, even if recently touched.
-                        ?: lru.firstOrNull { prefix != null && !it.key.startsWith(prefix) }
-                        // Then: old spans of the active source (already consumed or far behind).
-                        ?: lru.firstOrNull { !isRecent(it, now) }
-                        // Last resort: ordinary LRU, including active/recent spans.
-                        ?: lru.firstOrNull()
-                        ?: break
-                // Remove locally first so a failed SimpleCache removal cannot loop forever.
-                removeLocked(victim)
-                runCatching { cache.removeSpan(victim) }
-                    .onFailure { Log.w(TAG, "cache eviction failed for ${victim.key}", it) }
-                evictions += 1
+                }
+                if (victim == null) break
+
+                val success = try {
+                    cache.removeSpan(victim)
+                    true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "cache eviction failed for ${victim.key}", t)
+                    false
+                }
+
+                if (!success) {
+                    synchronized(lock) {
+                        addLocked(victim)
+                        failedVictims.add(victim)
+                        reconcileLocked(cache)
+                    }
+                }
+                evictions++
             }
-            if (currentSize > maxBytes) {
+            if (usageBytes() > maxBytes) {
                 Log.w(
                     TAG,
                     "cache still above target after $evictions evictions: " +
-                        "$currentSize > $maxBytes (protected spans)"
+                        "${usageBytes()} > $maxBytes (protected spans or failed removals)"
                 )
+            }
+        }
+
+        private fun selectVictimLocked(excluded: Set<CacheSpan>): CacheSpan? {
+            val now = System.currentTimeMillis()
+            return lru.firstOrNull { it !in excluded && !isSpanActive(it.key) && !isRecent(it, now) }
+                ?: lru.firstOrNull { it !in excluded && !isSpanActive(it.key) }
+                ?: lru.firstOrNull { it !in excluded && !isRecent(it, now) }
+                ?: lru.firstOrNull { it !in excluded }
+        }
+
+        private fun reconcileLocked(cache: Cache) {
+            try {
+                val keys = cache.keys
+                if (keys.isNotEmpty()) {
+                    val actualSpans = mutableListOf<CacheSpan>()
+                    for (k in keys) {
+                        actualSpans.addAll(cache.getCachedSpans(k))
+                    }
+                    if (actualSpans.isNotEmpty()) {
+                        lru.clear()
+                        lru.addAll(actualSpans.sortedBy { it.lastTouchTimestamp })
+                        currentSize = actualSpans.sumOf { it.length }
+                        return
+                    }
+                }
+                val space = runCatching { cache.cacheSpace }.getOrDefault(0L)
+                if (space > 0L) {
+                    currentSize = space
+                } else {
+                    currentSize = lru.sumOf { it.length }
+                }
+            } catch (_: Throwable) {
+                currentSize = lru.sumOf { it.length }
             }
         }
 

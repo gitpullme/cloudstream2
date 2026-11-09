@@ -403,6 +403,29 @@ object ForwardBufferPolicy {
             return decision(false, Reason.NOT_PLAYING)
         }
 
+        // Enforce paused-playback policy when playback is not advancing (playWhenReady == false).
+        // Prefetch fills up to targetMs (and not beyond it), without aggressive predictive starvation panic.
+        if (!playWhenReady) {
+            if (bufferedMs >= targetMs) return decision(false, Reason.TARGET_REACHED)
+            if (bytePanic || byteHigh) {
+                return decision(false, if (isLoading) Reason.BYTE_LIMIT_REACHED else Reason.WAITING_FOR_MEMORY)
+            }
+            if (critical || rebuffering) {
+                return decision(true, if (rebuffering) Reason.REBUFFER_RECOVERY else Reason.INITIAL_LOAD)
+            }
+            if (isLoading) {
+                return decision(true, Reason.CONTINUE)
+            }
+            if (plan.isLive && bufferedMs >= plan.refillMs) {
+                return decision(false, Reason.ABOVE_REFILL)
+            }
+            if (bufferedMs <= refillThreshold) {
+                if (!byteLow) return decision(false, Reason.WAITING_FOR_MEMORY)
+                return decision(true, Reason.BELOW_REFILL)
+            }
+            return decision(false, Reason.ABOVE_REFILL)
+        }
+
         if (isLoading) {
             if (bytePanic) return decision(false, Reason.BYTE_LIMIT_REACHED)
             if (critical) return decision(true, Reason.CONTINUE)

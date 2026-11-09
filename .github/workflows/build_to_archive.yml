@@ -22,19 +22,25 @@ jobs:
     steps:
     - name: Generate access token
       id: generate_token
+      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
         private_key: ${{ secrets.GH_APP_KEY }}
-        repository: "recloudstream/secrets"
+        installation_retrieval_mode: repository
+        installation_retrieval_payload: "recloudstream/secrets"
+        repositories: '["recloudstream/secrets"]'
 
     - name: Generate access token (archive)
       id: generate_archive_token
+      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
         private_key: ${{ secrets.GH_APP_KEY }}
-        repository: "recloudstream/cloudstream-archive"
+        installation_retrieval_mode: repository
+        installation_retrieval_payload: "recloudstream/cloudstream-archive"
+        repositories: '["recloudstream/cloudstream-archive"]'
 
     - uses: actions/checkout@v6
 
@@ -49,6 +55,7 @@ jobs:
 
     - name: Fetch keystore
       id: fetch_keystore
+      if: ${{ steps.generate_token.outputs.token != '' }}
       run: |
         TMP_KEYSTORE_FILE_PATH="${RUNNER_TEMP}"/keystore
         mkdir -p "${TMP_KEYSTORE_FILE_PATH}"
@@ -66,7 +73,7 @@ jobs:
     - name: Run Gradle
       run: ./gradlew assemblePrereleaseRelease
       env:
-        SIGNING_KEY_ALIAS: "key0"
+        SIGNING_KEY_ALIAS: ${{ steps.fetch_keystore.outputs.key_pwd != '' && 'key0' || '' }}
         SIGNING_KEY_PASSWORD: ${{ steps.fetch_keystore.outputs.key_pwd }}
         SIGNING_STORE_PASSWORD: ${{ steps.fetch_keystore.outputs.key_pwd }}
         SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
@@ -77,15 +84,18 @@ jobs:
         ANILIST_KEY: ${{ secrets.ANILIST_KEY }}
 
     - uses: actions/checkout@v6
+      if: ${{ steps.generate_archive_token.outputs.token != '' }}
       with:
         repository: "recloudstream/cloudstream-archive"
         token: ${{ steps.generate_archive_token.outputs.token }}
         path: "archive"
 
     - name: Move build
+      if: ${{ steps.generate_archive_token.outputs.token != '' }}
       run: cp app/build/outputs/apk/prerelease/release/*.apk "archive/$(git rev-parse --short HEAD).apk"
 
     - name: Push archive
+      if: ${{ steps.generate_archive_token.outputs.token != '' }}
       run: |
         cd $GITHUB_WORKSPACE/archive
         git config --local user.email "actions@github.com"
