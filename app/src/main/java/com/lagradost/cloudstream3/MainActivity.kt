@@ -2004,6 +2004,9 @@ class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCa
             // app exit or every launch would discard all cached playback data.
             loadCache()
             File(filesDir, "exoplayer").deleteRecursively() // old cache
+            // The old Cronet HTTP cache is no longer used; SimpleCache is now the only media
+            // cache. Remove the orphaned directory once on startup (no Cronet engine exists yet).
+            File(cacheDir, "CronetEngine").deleteRecursively()
         } catch (e: Exception) {
             logError(e)
         }

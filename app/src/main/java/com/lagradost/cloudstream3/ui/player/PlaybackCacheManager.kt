@@ -41,9 +41,6 @@ object PlaybackCacheManager {
     private const val MAX_CACHE_BYTES = 2L * 1024L * 1024L * 1024L
     private const val MIN_AUTO_CACHE_BYTES = 64L * 1024L * 1024L
     private const val MAX_AUTO_CACHE_BYTES = 2L * 1024L * 1024L * 1024L
-    private const val MIN_CRONET_CACHE_BYTES = 8L * 1024L * 1024L
-    private const val CRONET_DEFAULT_CACHE_BYTES = 128L * 1024L * 1024L
-    private const val CRONET_MAX_CACHE_BYTES = 512L * 1024L * 1024L
 
     private val lock = Any()
     private var cache: SimpleCache? = null
@@ -220,15 +217,6 @@ object PlaybackCacheManager {
         }.getOrDefault(0L)
         if (free <= 0L) return MIN_AUTO_CACHE_BYTES
         return (free / 8L).coerceIn(MIN_AUTO_CACHE_BYTES, MAX_AUTO_CACHE_BYTES)
-    }
-
-    /** Cronet's disk cache must also stay positive and bounded when the setting is Auto. */
-    fun resolveCronetCacheBytes(context: Context, requestedBytes: Long): Long {
-        if (requestedBytes > 0L) {
-            return requestedBytes.coerceIn(MIN_CRONET_CACHE_BYTES, CRONET_MAX_CACHE_BYTES)
-        }
-        val auto = resolveDiskCacheBytes(context, 0L) / 2L
-        return auto.coerceIn(CRONET_DEFAULT_CACHE_BYTES / 2, CRONET_MAX_CACHE_BYTES)
     }
 
     /**

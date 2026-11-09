@@ -776,7 +776,7 @@ class CS3IPlayer : IPlayer {
             return source
         }
 
-        fun tryCreateEngine(context: Context, diskCacheSize: Long): CronetEngine? {
+        fun tryCreateEngine(context: Context): CronetEngine? {
             // Fast case, no need to recreate it
             cronetEngine?.let {
                 return it
@@ -784,22 +784,18 @@ class CS3IPlayer : IPlayer {
 
             // https://gist.github.com/ShivamKumarJha/3c8398b47053ae05112d2a8f8b5de531
             return try {
-                val cacheDirectory = File(context.cacheDir, "CronetEngine")
-                if (!cacheDirectory.exists()) {
-                    cacheDirectory.mkdirs()
-                }
                 CronetEngine.Builder(context)
                     .enableBrotli(true)
                     .enableHttp2(true)
                     .enableQuic(true)
-                    .setStoragePath(cacheDirectory.absolutePath)
                     .setLibraryLoader(null)
-                    .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISK, diskCacheSize)
+                    // Media3's SimpleCache is the single playback disk cache: it understands
+                    // cache keys, active-source protection and Media3 eviction. A second HTTP
+                    // cache below it would duplicate disk usage and could serve a stale live
+                    // playlist whose HTTP headers do not forbid caching.
+                    .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0)
                     .build().also { buildEngine ->
-                        Log.d(
-                            TAG,
-                            "Created CronetEngine with cache at ${cacheDirectory.absolutePath}"
-                        )
+                        Log.d(TAG, "Created CronetEngine without a second HTTP cache")
                         cronetEngine = buildEngine
                     }
             } catch (t: Throwable) {
@@ -2022,10 +2018,7 @@ class CS3IPlayer : IPlayer {
             val onlineSourceFactory =
                 createVideoSource(
                     link = link,
-                    engine = tryCreateEngine(
-                        context,
-                        PlaybackCacheManager.resolveCronetCacheBytes(context, simpleCacheSize)
-                    ),
+                    engine = tryCreateEngine(context),
                     interceptor = interceptor
                 )
 
