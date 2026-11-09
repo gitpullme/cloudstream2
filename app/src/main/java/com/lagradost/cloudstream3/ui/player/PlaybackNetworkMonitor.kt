@@ -45,6 +45,7 @@ class PlaybackNetworkMonitor : TransferListener {
     private var lastTransferEwmaMs = 0.0
     private var samples = 0
     private var lastLogRealtimeMs = 0L
+    private var lastPhaseLogRealtimeMs = 0L
     private var lastTransferEndRealtimeMs = 0L
 
     fun reset() {
@@ -57,6 +58,7 @@ class PlaybackNetworkMonitor : TransferListener {
             lastTransferEwmaMs = 0.0
             samples = 0
             lastLogRealtimeMs = 0L
+            lastPhaseLogRealtimeMs = 0L
             lastTransferEndRealtimeMs = 0L
         }
     }
@@ -71,7 +73,7 @@ class PlaybackNetworkMonitor : TransferListener {
                 -1L
             }
             requests[source] = RequestState(now, gap)
-            if (BuildConfig.DEBUG) {
+            if (BuildConfig.DEBUG && shouldLogPhase(now)) {
                 Log.d(
                     TAG,
                     "net init gap=${if (gap >= 0L) "${gap}ms" else "first"} " +
@@ -88,7 +90,7 @@ class PlaybackNetworkMonitor : TransferListener {
             val state = requests[source] ?: RequestState(now, -1L)
                 .also { requests[source] = it }
             if (state.startRealtimeMs == 0L) state.startRealtimeMs = now
-            if (BuildConfig.DEBUG) {
+            if (BuildConfig.DEBUG && shouldLogPhase(now)) {
                 Log.d(
                     TAG,
                     "net headers wait=${(now - state.initRealtimeMs).coerceAtLeast(0L)}ms " +
@@ -112,7 +114,7 @@ class PlaybackNetworkMonitor : TransferListener {
             if (state.startRealtimeMs == 0L) state.startRealtimeMs = now
             if (state.firstByteRealtimeMs == 0L) {
                 state.firstByteRealtimeMs = now
-                if (BuildConfig.DEBUG) {
+                if (BuildConfig.DEBUG && shouldLogPhase(now)) {
                     Log.d(
                         TAG,
                         "net first byte after=${now - state.initRealtimeMs}ms " +
@@ -232,6 +234,13 @@ class PlaybackNetworkMonitor : TransferListener {
         val ewmaBps: Long,
         val samples: Int,
     )
+
+    /** Must be called while holding [lock]. */
+    private fun shouldLogPhase(now: Long): Boolean {
+        if (now - lastPhaseLogRealtimeMs < LOG_INTERVAL_MS) return false
+        lastPhaseLogRealtimeMs = now
+        return true
+    }
 
     companion object {
         private const val TAG = "CS3Buffer"
