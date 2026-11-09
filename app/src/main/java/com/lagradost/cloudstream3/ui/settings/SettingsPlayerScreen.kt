@@ -13,10 +13,12 @@ import androidx.compose.ui.res.integerArrayResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringArrayResource
 import androidx.compose.ui.res.stringResource
+import coil3.SingletonImageLoader
 import com.lagradost.cloudstream3.CommonActivity.activity
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.ui.player.source_priority.QualityProfileDialog
+import com.lagradost.cloudstream3.ui.player.PlaybackCacheManager
 import com.lagradost.cloudstream3.ui.settings.SettingsFragment.Companion.getFolderSize
 import com.lagradost.cloudstream3.ui.subtitles.ChromecastSubtitlesFragment
 import com.lagradost.cloudstream3.ui.subtitles.SubtitlesFragment
@@ -53,7 +55,7 @@ object SettingsPlayerScreen : SearchableSettings {
 
         var cacheSize by remember { mutableLongStateOf(0L) }
         var cacheCleared by remember { mutableIntStateOf(0) }
-        val cacheDir = LocalContext.current.cacheDir
+        val cacheDir = context.cacheDir
         LaunchedEffect(cacheCleared) {
             withContext(Dispatchers.IO) {
                 cacheSize = getFolderSize(cacheDir)
@@ -346,7 +348,15 @@ object SettingsPlayerScreen : SearchableSettings {
                         subtitle = formatShortFileSize(LocalContext.current, cacheSize),
                         onClick = {
                             ioSafe {
-                                cacheDir.deleteRecursively()
+                                // Use Media3's cache API instead of deleting files under a live
+                                // SimpleCache. The active title's spans are protected by the
+                                // manager even when audio-only playback is in the background.
+                                PlaybackCacheManager.get(
+                                    context.applicationContext,
+                                    settings.player.bufferDiskMB.get().toLong() * 1024L * 1024L,
+                                )
+                                PlaybackCacheManager.clearAll()
+                                SingletonImageLoader.get(context).diskCache?.clear()
                                 cacheCleared += 1
                             }
                         })

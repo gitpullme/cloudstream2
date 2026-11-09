@@ -32,14 +32,11 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 // import androidx.media3.common.util.ExperimentalApi
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.datasource.cronet.CronetDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DecoderCounters
@@ -79,7 +76,6 @@ import com.lagradost.cloudstream3.CloudStreamApp.Companion.getKey
 import com.lagradost.cloudstream3.CloudStreamApp.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity.activity
 import com.lagradost.cloudstream3.ErrorLoadingException
-import com.lagradost.cloudstream3.MainActivity.Companion.deleteFileOnExit
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.USER_AGENT
@@ -195,6 +191,18 @@ class CS3IPlayer : IPlayer {
         val mediaItem: MediaItem,
         val durationUs: Long,
         val drm: DrmMetadata? = null
+    )
+
+    /**
+     * An upstream HTTP source together with the request headers that influence the response.
+     *
+     * The headers are part of the disk cache key: two providers can serve the same URL with
+     * different Authorization/Referer/Cookie values, and a cache hit must never cross that
+     * boundary.
+     */
+    data class OnlineSource(
+        val factory: HttpDataSource.Factory,
+        val headers: Map<String, String>,
     )
 
     data class DrmMetadata(
@@ -608,7 +616,8 @@ class CS3IPlayer : IPlayer {
 
         currentTextRenderer = null
         currentSubtitleDecoder = null
-        activeLoadControl?.playbackState = Player.STATE_IDLE
+        val loadControl = activeLoadControl
+        loadControl?.playbackState = Player.STATE_IDLE
         activeLoadControl = null
 
         exoPlayer?.apply {
@@ -629,11 +638,13 @@ class CS3IPlayer : IPlayer {
             stop()
             release()
         }
-        //simpleCache?.release()
+        // Media3 normally calls LoadControl.onReleased, but the public player is dropped here.
+        // Make cleanup explicit so component callbacks cannot leak across player recreation.
+        loadControl?.release()
+        PlaybackCacheManager.clearActiveSource()
 
         exoPlayer = null
         event(PlayerAttachedEvent(null))
-        //simpleCache = null
     }
 
     override fun onStop() {
@@ -745,8 +756,6 @@ class CS3IPlayer : IPlayer {
                 field = value
             }
 
-        private var simpleCache: SimpleCache? = null
-
         /// Create a small factory for small things, no cache, no cronet
         private fun createOnlineSource(
             headers: Map<String, String>?,
@@ -776,7 +785,6 @@ class CS3IPlayer : IPlayer {
             // https://gist.github.com/ShivamKumarJha/3c8398b47053ae05112d2a8f8b5de531
             return try {
                 val cacheDirectory = File(context.cacheDir, "CronetEngine")
-                cacheDirectory.deleteRecursively()
                 if (!cacheDirectory.exists()) {
                     cacheDirectory.mkdirs()
                 }
@@ -805,7 +813,7 @@ class CS3IPlayer : IPlayer {
             link: ExtractorLink,
             engine: CronetEngine?,
             interceptor: Interceptor?,
-        ): HttpDataSource.Factory {
+        ): OnlineSource {
             val userAgent = link.headers.entries.find {
                 it.key.equals("User-Agent", ignoreCase = true)
             }?.value ?: USER_AGENT
@@ -839,9 +847,17 @@ class CS3IPlayer : IPlayer {
             // for WIDEVINE/drm as well? Do that if someone gets 404 and creates an issue.
             val headers = refererMap + link.headers // Adds the headers from the provider, e.g Authorization
 
-            return source.apply {
+            val configured = source.apply {
                 setDefaultRequestProperties(headers)
             }
+            // The user agent is applied separately by setUserAgent above, but it also identifies
+            // the response (some providers serve different streams per UA), so include it in the
+            // cache key without modifying the request headers.
+            val keyHeaders = buildMap {
+                putAll(headers)
+                put("User-Agent", userAgent)
+            }
+            return OnlineSource(configured, keyHeaders)
         }
 
         private fun Context.createOfflineSource(): DataSource.Factory {
@@ -849,22 +865,6 @@ class CS3IPlayer : IPlayer {
                 this,
                 DefaultHttpDataSource.Factory().setUserAgent(USER_AGENT)
             )
-        }
-
-        private fun getCache(context: Context, cacheSize: Long): SimpleCache? {
-            return try {
-                val databaseProvider = StandaloneDatabaseProvider(context)
-                SimpleCache(
-                    File(
-                        context.cacheDir, "exoplayer"
-                    ).also { deleteFileOnExit(it) }, // Ensures always fresh file
-                    LeastRecentlyUsedCacheEvictor(cacheSize),
-                    databaseProvider
-                )
-            } catch (e: Exception) {
-                logError(e)
-                null
-            }
         }
 
         private fun getMediaItemBuilder(mimeType: String):
@@ -1085,7 +1085,7 @@ class CS3IPlayer : IPlayer {
         subtitleOffset: Long,
         cacheSize: Long,
         videoBufferMs: Long,
-        onlineSource: HttpDataSource.Factory? = null,
+        onlineSource: OnlineSource? = null,
         playWhenReady: Boolean = true,
         trackSelector: TrackSelector? = null,
         /**
@@ -1276,18 +1276,62 @@ class CS3IPlayer : IPlayer {
         val extractorFactor = UpdatedDefaultExtractorsFactory()
             .setFragmentedMp4ExtractorFlags(FragmentedMp4Extractor.FLAG_MERGE_FRAGMENTED_SIDX)
 
-        // Create an online connection with cache for all online sources
-        val dataSourceFactory = if (onlineSource == null) {
+        // Create an online connection with cache for all online sources.
+        val dataSourceFactory: DataSource.Factory? = if (onlineSource == null) {
             null
         } else {
-            if (simpleCache == null)
-                simpleCache = getCache(context, simpleCacheSize)
-
-            val cacheFactory = CacheDataSource.Factory().apply {
-                simpleCache?.let { setCache(it) }
-                setUpstreamDataSourceFactory(onlineSource)
+            val loadControl = activeLoadControl
+            val cache = PlaybackCacheManager.get(context, simpleCacheSize)
+            val upstream = if (loadControl != null) {
+                // Only the upstream HTTP data source sees real network requests. Cache reads bypass
+                // it, so the measured throughput is never inflated by disk cache hits.
+                InstrumentedHttpDataSourceFactory(
+                    onlineSource.factory,
+                    loadControl.transferListener,
+                )
+            } else {
+                onlineSource.factory
             }
-            cacheFactory
+
+            if (cache == null) {
+                // Cache initialization failed; playback must still work without it.
+                upstream
+            } else {
+                val cacheFactory = CacheDataSource.Factory().apply {
+                    setCache(cache)
+                    setUpstreamDataSourceFactory(upstream)
+                    setCacheKeyFactory(HeaderAwareCacheKeyFactory(onlineSource.headers))
+                    // A full disk or a failed cache write must degrade to network playback, not
+                    // abort the title.
+                    setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                    loadControl?.let { setEventListener(it.cacheEventListener) }
+                }
+                CacheRoutingDataSourceFactory(
+                    cacheFactory = cacheFactory,
+                    upstreamFactory = upstream,
+                    shouldBypass = PlaybackCacheManager::shouldBypassCache,
+                )
+            }
+        }
+
+        // Protect the active title's cache spans from eviction while it is being watched.
+        val firstSourceUri = if (onlineSource == null) {
+            null
+        } else {
+            mediaItemSlices.firstOrNull()
+                ?.mediaItem?.localConfiguration?.uri?.toString()
+        }
+        if (firstSourceUri != null) {
+            val path = firstSourceUri.substringBefore('?').substringBefore('#')
+            val mime = mediaItemSlices.firstOrNull()
+                ?.mediaItem?.localConfiguration?.mimeType
+            val isPlaylist = mime == MimeTypes.APPLICATION_M3U8 ||
+                mime == MimeTypes.APPLICATION_MPD ||
+                path.endsWith(".m3u8", ignoreCase = true) ||
+                path.endsWith(".mpd", ignoreCase = true)
+            PlaybackCacheManager.setActiveSource(firstSourceUri, directoryScope = isPlaylist)
+        } else {
+            PlaybackCacheManager.clearActiveSource()
         }
 
         val defaultMediaSourceFactory = if (dataSourceFactory != null) {
@@ -1404,7 +1448,7 @@ class CS3IPlayer : IPlayer {
         mediaSlices: List<MediaItemSlice>,
         subSources: List<SingleSampleMediaSource>,
         audioSources: List<MediaSource> = emptyList(),
-        onlineSource: HttpDataSource.Factory? = null,
+        onlineSource: OnlineSource? = null,
     ) {
         Log.i(TAG, "loadExo")
         val settingsManager = PreferenceManager.getDefaultSharedPreferences(context)
@@ -1978,7 +2022,10 @@ class CS3IPlayer : IPlayer {
             val onlineSourceFactory =
                 createVideoSource(
                     link = link,
-                    engine = tryCreateEngine(context, simpleCacheSize),
+                    engine = tryCreateEngine(
+                        context,
+                        PlaybackCacheManager.resolveCronetCacheBytes(context, simpleCacheSize)
+                    ),
                     interceptor = interceptor
                 )
 

@@ -1,7 +1,9 @@
 package com.lagradost.cloudstream3.ui.player
 
 import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Context
+import android.content.res.Configuration
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
@@ -10,6 +12,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.analytics.PlayerId
@@ -21,59 +24,120 @@ import com.lagradost.cloudstream3.BuildConfig
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * A thin [LoadControl] wrapper that replaces only the "should we load more?" decision while
- * leaving all ExoPlayer mechanics (allocator, back buffer, start/rebuffer thresholds, lifecycle)
- * to a carefully configured [DefaultLoadControl].
+ * A [LoadControl] that keeps Media3's allocator/back-buffer/playback-start mechanics but replaces
+ * only the "should we load more?" decision with [ForwardBufferPolicy].
  *
- * The delegate is built with the user's Video Buffer Length as `maxBufferMs` and
- * [ForwardBufferPolicy]'s low watermark as `minBufferMs`, so the effective Media3 defaults are
- * correct even if some other component ever queries them. Actual loading decisions come from
- * [ForwardBufferPolicy], which:
+ * The policy is fed by real measurements from [PlaybackNetworkMonitor] and Media3's own
+ * [LoadControl.Parameters] (media position, forward buffer, playback speed, rebuffering state).
+ * It therefore starts replenishing well before Media3's fixed threshold when throughput is low or
+ * volatile, while still respecting the user's Video Buffer Length as the upper target and the
+ * device's allocator budget as the memory ceiling.
  *
- * - restarts loading at 80% of the configured target instead of at Media3's fixed 50 s,
- * - keeps the time target from exceeding the user's RAM/allocator budget,
- * - applies byte hysteresis so the byte cap cannot cause rapid on/off flapping,
- * - always guarantees enough headroom to recover from seeks and rebuffers,
- * - uses a smaller target for live streams and scales the low watermark with playback speed.
- *
- * All callbacks are expected on ExoPlayer's playback thread, but the per-player state is
- * synchronized anyway because preloading/other Media3 components may call a shared LoadControl
- * from a different thread in the future.
+ * All calls are expected on ExoPlayer's playback thread, but per-player state is synchronized
+ * because preloading and other Media3 components may call a shared control from a different
+ * thread in the future.
  */
 @OptIn(UnstableApi::class)
 class ProactiveLoadControl private constructor(
     private val delegate: DefaultLoadControl,
     private val config: ForwardBufferPolicy.Config,
+    private val appContext: Context,
 ) : LoadControl {
 
     private class PlayerState(
         @Volatile var plan: ForwardBufferPolicy.Plan,
         var isLoading: Boolean = false,
+        var lastReason: ForwardBufferPolicy.Reason? = null,
         var lastLogRealtimeMs: Long = 0L,
         var lastLiveCheckRealtimeMs: Long = 0L,
+        var cachedBytes: Long = 0L,
+        var cacheReadEvents: Long = 0L,
+        var cacheIgnoredCount: Long = 0L,
+        var lastCacheSizeBytes: Long = 0L,
+        var videoWidth: Int = 0,
+        var videoHeight: Int = 0,
+        var selectedMime: String? = null,
+        var lastForwardMs: Long = 0L,
     )
 
     private val states = ConcurrentHashMap<PlayerId, PlayerState>()
     private val allocators = ConcurrentHashMap<PlayerId, Allocator>()
 
+    /** Receives real upstream request samples. Attach this to the network data source factory. */
+    val transferListener = PlaybackNetworkMonitor()
+
     /**
-     * Current ExoPlayer playback state, mirrored here only for debug diagnostics. Updated by
-     * CS3IPlayer's player listener on the application thread.
+     * CacheDataSource reports cached bytes and cache-ignore events here. Cached bytes are
+     * deliberately not treated as network throughput.
+     */
+    val cacheEventListener: CacheDataSource.EventListener = object : CacheDataSource.EventListener {
+        override fun onCachedBytesRead(cacheSizeBytes: Long, cachedBytesRead: Long) {
+            for (state in states.values) {
+                synchronized(state) {
+                    state.cachedBytes += cachedBytesRead
+                    state.cacheReadEvents += 1
+                    state.lastCacheSizeBytes = cacheSizeBytes
+                }
+            }
+        }
+
+        override fun onCacheIgnored(reason: Int) {
+            for (state in states.values) {
+                synchronized(state) {
+                    state.cacheIgnoredCount += 1
+                }
+            }
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, "cache ignored reason=$reason")
+            }
+        }
+    }
+
+    /**
+     * Current ExoPlayer playback state, mirrored by CS3IPlayer for diagnostics and for the policy's
+     * end-of-stream guard. Do not use IDLE as "not playing": during prepare the mirror can still be
+     * IDLE while the initial load must be allowed to start.
      */
     @Volatile
     var playbackState: Int = Player.STATE_IDLE
 
+    @Volatile
+    private var memoryPressureUntilMs: Long = 0L
+
+    private val componentCallbacks = object : ComponentCallbacks2 {
+        override fun onTrimMemory(level: Int) {
+            if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+                memoryPressureUntilMs =
+                    SystemClock.elapsedRealtime() + ForwardBufferPolicy.MEMORY_PRESSURE_HOLD_MS
+                Log.w(TAG, "memory pressure level=$level, reducing buffer target temporarily")
+            }
+        }
+
+        override fun onLowMemory() {
+            memoryPressureUntilMs =
+                SystemClock.elapsedRealtime() + ForwardBufferPolicy.MEMORY_PRESSURE_HOLD_MS
+            Log.w(TAG, "onLowMemory, reducing buffer target temporarily")
+        }
+
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            // Not relevant to buffer policy.
+        }
+    }
+
+    init {
+        appContext.registerComponentCallbacks(componentCallbacks)
+    }
+
     override fun onPrepared(playerId: PlayerId) {
         delegate.onPrepared(playerId)
-        states[playerId] = PlayerState(
-            ForwardBufferPolicy.createPlan(
-                config = config,
-                isLive = false,
-                selectedBitrateBps = 0L,
-            )
+        val plan = ForwardBufferPolicy.createPlan(
+            config = config,
+            isLive = false,
+            selectedBitrateBps = 0L,
         )
+        states[playerId] = PlayerState(plan)
         allocators[playerId] = delegate.getAllocator(playerId)
-        logPlan("prepared", states[playerId]?.plan)
+        logPlan("prepared", plan)
     }
 
     override fun onTracksSelected(
@@ -88,10 +152,14 @@ class ProactiveLoadControl private constructor(
         ).also { states[parameters.playerId] = it }
 
         val isLive = parameters.isLive()
-        val bitrate = trackSelections.sumSelectedBitrate()
+        val trackInfo = trackSelections.trackInfo()
         synchronized(state) {
-            state.plan = ForwardBufferPolicy.createPlan(config, isLive, bitrate)
+            state.plan = ForwardBufferPolicy.createPlan(config, isLive, trackInfo.bitrateBps)
+            state.videoWidth = trackInfo.width
+            state.videoHeight = trackInfo.height
+            state.selectedMime = trackInfo.mime
         }
+        PlaybackCacheManager.setSourceLive(isLive)
         logPlan("tracks selected", state.plan)
     }
 
@@ -101,9 +169,9 @@ class ProactiveLoadControl private constructor(
             ForwardBufferPolicy.createPlan(config, isLive = false, selectedBitrateBps = 0L)
         ).also { states[playerId] = it }
 
-        // Progressive live streams may only be identified after preparation, when the extractor
-        // discovers an unknown duration. This check is throttled because shouldContinueLoading is
-        // called on every playback-loop tick while the buffer is full.
+        // Progressive live streams can only be classified after preparation, when the extractor
+        // discovers an unknown duration. The check is throttled because this method is called on
+        // every playback-loop tick while the buffer is full.
         val liveDiscovered = synchronized(state) {
             val now = SystemClock.elapsedRealtime()
             if (!state.plan.isLive &&
@@ -125,16 +193,29 @@ class ProactiveLoadControl private constructor(
             }
         }
         if (liveDiscovered) {
+            PlaybackCacheManager.setSourceLive(true)
             logPlan("live discovered", state.plan)
         }
 
         val allocatedBytes = try {
             allocatorFor(playerId).totalBytesAllocated.toLong()
         } catch (_: Throwable) {
-            // The player may be between onStopped/onPrepared. Treat it as an empty allocator;
-            // the time policy can still make a safe decision.
+            // The player may be between onStopped/onPrepared. The time policy can still decide.
             0L
         }
+        val network = transferListener.snapshot()
+        val memoryPressure = SystemClock.elapsedRealtime() < memoryPressureUntilMs
+        // Snapshot cheap, lock-free-by-SimpleCache values before taking the policy state lock.
+        // SimpleCache can hold its own lock while delivering cache callbacks, so taking the
+        // cache lock while holding the policy lock would be a lock-order inversion. Production
+        // builds skip this entirely; it only feeds debug diagnostics.
+        val cacheSnapshot = if (BuildConfig.DEBUG) {
+            PlaybackCacheManager.snapshot()
+        } else {
+            PlaybackCacheManager.CacheSnapshot(0L, 0L, false, 0L)
+        }
+        val cacheBypassed = BuildConfig.DEBUG && PlaybackCacheManager.isBypassingCache()
+
         val decision = synchronized(state) {
             val decision = ForwardBufferPolicy.decide(
                 plan = state.plan,
@@ -142,10 +223,27 @@ class ProactiveLoadControl private constructor(
                 bufferedDurationUs = parameters.bufferedDurationUs,
                 allocatedBytes = allocatedBytes,
                 playbackSpeed = parameters.playbackSpeed,
+                network = network,
+                playbackState = playbackState,
+                playWhenReady = parameters.playWhenReady,
+                rebuffering = parameters.rebuffering,
+                memoryPressure = memoryPressure,
             )
             val changed = decision.isLoading != state.isLoading
+            val reasonChanged = decision.reason != state.lastReason
             state.isLoading = decision.isLoading
-            logDecision(parameters, state, allocatedBytes, decision, changed)
+            state.lastReason = decision.reason
+            logDecision(
+                parameters,
+                state,
+                allocatedBytes,
+                network,
+                decision,
+                changed,
+                reasonChanged,
+                cacheSnapshot,
+                cacheBypassed,
+            )
             decision
         }
         return decision.isLoading
@@ -186,6 +284,29 @@ class ProactiveLoadControl private constructor(
         delegate.onReleased(playerId)
         states.remove(playerId)
         allocators.remove(playerId)
+        if (states.isEmpty()) {
+            shutdownCallbacks()
+        }
+    }
+
+    /**
+     * Safety net for player-recreation paths where the public [Player] is dropped before Media3
+     * delivers [onReleased]. Safe to call more than once.
+     */
+    fun release() {
+        states.clear()
+        allocators.clear()
+        transferListener.reset()
+        shutdownCallbacks()
+    }
+
+    @Volatile
+    private var callbacksRegistered = true
+
+    private fun shutdownCallbacks() {
+        if (!callbacksRegistered) return
+        callbacksRegistered = false
+        runCatching { appContext.unregisterComponentCallbacks(componentCallbacks) }
     }
 
     private fun allocatorFor(playerId: PlayerId): Allocator =
@@ -203,8 +324,18 @@ class ProactiveLoadControl private constructor(
         }
     }
 
-    private fun Array<ExoTrackSelection?>.sumSelectedBitrate(): Long {
-        var total = 0L
+    private data class TrackInfo(
+        val bitrateBps: Long,
+        val width: Int,
+        val height: Int,
+        val mime: String?,
+    )
+
+    private fun Array<ExoTrackSelection?>.trackInfo(): TrackInfo {
+        var bitrateBps = 0L
+        var width = 0
+        var height = 0
+        var mime: String? = null
         for (selection in this) {
             val format = try {
                 selection?.getSelectedFormat()
@@ -216,9 +347,14 @@ class ProactiveLoadControl private constructor(
                 format.averageBitrate != Format.NO_VALUE -> format.averageBitrate
                 else -> 0
             }
-            if (bitrate > 0) total += bitrate.toLong()
+            if (bitrate > 0) bitrateBps += bitrate.toLong()
+            if (format.sampleMimeType?.startsWith("video/") == true) {
+                if (format.width > width) width = format.width
+                if (format.height > height) height = format.height
+                mime = format.sampleMimeType
+            }
         }
-        return total
+        return TrackInfo(bitrateBps, width, height, mime)
     }
 
     private fun logPlan(reason: String, plan: ForwardBufferPolicy.Plan?) {
@@ -226,8 +362,7 @@ class ProactiveLoadControl private constructor(
         Log.d(
             TAG,
             "buffer plan ($reason) target=${plan.targetMs}ms refill=${plan.refillMs}ms " +
-                "requested=${plan.requestedBufferMs}ms timeTarget=${plan.timeTargetMs}ms " +
-                "byteTarget=${plan.byteLimitedTargetMs ?: "unknown"}ms " +
+                "requested=${plan.requestedBufferMs}ms consumption=${plan.consumptionBps}bps " +
                 "budget=${plan.memoryBudgetBytes}B lowBudget=${plan.lowMemoryWatermarkBytes}B " +
                 "live=${plan.isLive} lowRam=${plan.lowRamDevice} " +
                 "bitrate=${plan.selectedBitrateBps}bps"
@@ -238,12 +373,16 @@ class ProactiveLoadControl private constructor(
         parameters: LoadControl.Parameters,
         state: PlayerState,
         allocatedBytes: Long,
+        network: ForwardBufferPolicy.NetworkStats,
         decision: ForwardBufferPolicy.Decision,
         changed: Boolean,
+        reasonChanged: Boolean,
+        cache: PlaybackCacheManager.CacheSnapshot,
+        cacheBypassed: Boolean,
     ) {
         if (!BuildConfig.DEBUG) return
         val now = SystemClock.elapsedRealtime()
-        if (!changed && now - state.lastLogRealtimeMs < LOG_INTERVAL_MS) return
+        if (!changed && !reasonChanged && now - state.lastLogRealtimeMs < LOG_INTERVAL_MS) return
         state.lastLogRealtimeMs = now
 
         val action = when {
@@ -254,19 +393,40 @@ class ProactiveLoadControl private constructor(
         val bufferedPositionMs =
             (parameters.playbackPositionUs +
                 parameters.bufferedDurationUs.coerceAtLeast(0L)) / 1_000
+        val forwardMs = parameters.bufferedDurationUs.coerceAtLeast(0L) / 1_000
+        val bufferGrowthMs = forwardMs - state.lastForwardMs
+        state.lastForwardMs = forwardMs
+        val cacheHitKb = synchronized(state) { state.cachedBytes / 1024L }
+        val readEvents = synchronized(state) { state.cacheReadEvents }
+        val ignored = synchronized(state) { state.cacheIgnoredCount }
         Log.d(
             TAG,
             "$action reason=${decision.reason} " +
                 "pos=${parameters.playbackPositionUs / 1_000}ms " +
                 "bufferedPosition=${bufferedPositionMs}ms " +
-                "forwardBuffer=${parameters.bufferedDurationUs / 1_000}ms " +
-                "target=${state.plan.targetMs}ms refill=${state.plan.refillMs}ms " +
-                "bytes=$allocatedBytes/${state.plan.memoryBudgetBytes}B " +
+                "forward=${forwardMs}ms growth=${bufferGrowthMs}ms " +
+                "runway=${decision.runwayMs}ms " +
+                "target=${decision.effectiveTargetMs}ms refill=${decision.refillThresholdMs}ms " +
+                "refillFraction=${"%.3f".format(decision.dynamicRefillFraction)} " +
                 "speed=${parameters.playbackSpeed} playWhenReady=${parameters.playWhenReady} " +
                 "rebuffering=${parameters.rebuffering} " +
-                "playbackState=${playbackStateName(playbackState)} " +
-                "live=${state.plan.isLive} bitrate=${state.plan.selectedBitrateBps}bps " +
-                "lowRam=${state.plan.lowRamDevice}"
+                "state=${playbackStateName(playbackState)} live=${state.plan.isLive} " +
+                "bitrate=${state.plan.selectedBitrateBps}bps " +
+                "resolution=${state.videoWidth}x${state.videoHeight} " +
+                "mime=${state.selectedMime ?: "unknown"} " +
+                "consumption=${decision.consumptionBps}bps " +
+                "thr=${decision.throughputBps}B/s peak=${network.peakThroughputBps}B/s " +
+                "var=${"%.2f".format(network.throughputVariation)} " +
+                "ttfb=${network.startupLatencyMs}ms xfer=${network.lastTransferMs}ms " +
+                "etaRefill=${decision.timeToRefillMs}ms " +
+                "exhaustsBeforeRefill=${decision.timeToRefillMs > decision.runwayMs} " +
+                "bytes=$allocatedBytes/${state.plan.memoryBudgetBytes}B " +
+                "cache=${cache.usageBytes / (1024L * 1024L)}MB/" +
+                "${cache.maxBytes / (1024L * 1024L)}MB " +
+                "cacheRead=${cacheHitKb}KB events=$readEvents " +
+                "cacheWrite=${cache.writtenBytes / 1024L}KB ignored=$ignored " +
+                "cacheBypass=$cacheBypassed " +
+                "memPressure=${decision.memoryPressure} lowRam=${state.plan.lowRamDevice}"
         )
     }
 
@@ -279,10 +439,9 @@ class ProactiveLoadControl private constructor(
     }
 
     companion object {
-        private const val TAG = "CS3LoadControl"
-        private const val LOG_INTERVAL_MS = 10_000L
+        private const val TAG = "CS3Buffer"
+        private const val LOG_INTERVAL_MS = 5_000L
         private const val LIVE_CHECK_INTERVAL_MS = 5_000L
-        private const val BACK_BUFFER_MS = 30_000
 
         /**
          * Builds a load control for one ExoPlayer instance.
@@ -297,14 +456,21 @@ class ProactiveLoadControl private constructor(
         ): ProactiveLoadControl {
             val activityManager =
                 context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val memoryInfo = ActivityManager.MemoryInfo()
+            runCatching { activityManager?.getMemoryInfo(memoryInfo) }
+
             val config = ForwardBufferPolicy.Config(
                 requestedBufferMs = videoBufferMs,
                 requestedRamBytes = targetBufferBytes,
                 lowRamDevice = activityManager?.isLowRamDevice == true,
+                memoryClassMb = activityManager?.memoryClass ?: 0,
+                maxHeapBytes = Runtime.getRuntime().maxMemory(),
+                systemAvailableBytes = memoryInfo.availMem,
             )
 
-            // At this point no track has been selected, so the plan uses the time target and the
-            // memory budget. The per-track byte-limited target is recalculated in onTracksSelected.
+            // At this point no track has been selected, so the plan uses the duration target and
+            // the device memory budget. The per-track consumption rate is recalculated in
+            // onTracksSelected.
             val initialPlan = ForwardBufferPolicy.createPlan(
                 config = config,
                 isLive = false,
@@ -313,21 +479,32 @@ class ProactiveLoadControl private constructor(
 
             val delegate = DefaultLoadControl.Builder()
                 .setTargetBufferBytes(initialPlan.memoryBudgetBytes)
-                .setBackBuffer(BACK_BUFFER_MS, true)
+                .setBackBuffer(ForwardBufferPolicy.BACK_BUFFER_MS.toInt(), true)
                 .setBufferDurationsMs(
                     initialPlan.refillMs.toInt(),
                     initialPlan.targetMs.toInt(),
                     DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
                     DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
                 )
-                // The custom policy already prioritises time up to the byte budget and treats the
-                // byte cap as a hard memory safeguard. Keep DefaultLoadControl's default here so
-                // its shouldStartPlayback() retains the ability to start when the byte target is
-                // reached with very little buffered data (important on low-memory devices).
+                // The custom policy enforces time and byte hysteresis itself. Keep this false so
+                // DefaultLoadControl.shouldStartPlayback() can still start when the allocator
+                // budget is reached with little buffered data (important on low-memory devices).
                 .setPrioritizeTimeOverSizeThresholds(false)
                 .build()
 
-            return ProactiveLoadControl(delegate, config)
+            Log.i(
+                TAG,
+                "load control config buffer=${initialPlan.targetMs}ms " +
+                    "refill=${initialPlan.refillMs}ms budget=${initialPlan.memoryBudgetBytes}B " +
+                    "lowRam=${initialPlan.lowRamDevice} memoryClass=${config.memoryClassMb}MB " +
+                    "bitrate=${initialPlan.selectedBitrateBps}bps"
+            )
+
+            return ProactiveLoadControl(
+                delegate = delegate,
+                config = config,
+                appContext = context.applicationContext,
+            )
         }
     }
 }

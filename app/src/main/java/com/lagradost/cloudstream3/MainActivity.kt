@@ -1998,10 +1998,12 @@ class MainActivity : AppCompatActivity(), ColorPickerDialogListener, BiometricCa
         APIRepository.dubStatusActive = getApiDubstatusSettings()
 
         try {
-            // this ensures that no unnecessary space is taken
+            // This ensures that no unnecessary space is taken by the legacy cache location.
+            // The current playback cache (cacheDir/exoplayer) is intentionally persistent and is
+            // bounded/evicted by PlaybackCacheManager; it must not be registered for deletion on
+            // app exit or every launch would discard all cached playback data.
             loadCache()
             File(filesDir, "exoplayer").deleteRecursively() // old cache
-            deleteFileOnExit(File(cacheDir, "exoplayer"))   // current cache
         } catch (e: Exception) {
             logError(e)
         }
