@@ -17,10 +17,12 @@ permissions:
 jobs:
   create:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP_TOKEN: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
     steps:
     - name: Generate access token
       id: generate_token
-      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
+      if: env.HAS_APP_TOKEN == 'true'
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
@@ -40,7 +42,7 @@ jobs:
       run: python3 .github/locales.py
 
     - name: Commit to the repo
-      if: ${{ steps.generate_token.outputs.token != '' }}
+      if: steps.generate_token.outputs.token != ''
       run: |
         git config --local user.email "111277985+recloudstream[bot]@users.noreply.github.com"
         git config --local user.name "recloudstream[bot]"

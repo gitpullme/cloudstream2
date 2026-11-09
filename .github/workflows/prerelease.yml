@@ -18,10 +18,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP_TOKEN: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
     steps:
     - name: Generate access token
       id: generate_token
-      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
+      if: env.HAS_APP_TOKEN == 'true'
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
@@ -43,7 +45,7 @@ jobs:
 
     - name: Fetch keystore
       id: fetch_keystore
-      if: ${{ steps.generate_token.outputs.token != '' }}
+      if: steps.generate_token.outputs.token != ''
       run: |
         TMP_KEYSTORE_FILE_PATH="${RUNNER_TEMP}"/keystore
         mkdir -p "${TMP_KEYSTORE_FILE_PATH}"

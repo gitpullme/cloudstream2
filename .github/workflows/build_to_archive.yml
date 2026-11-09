@@ -19,10 +19,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP_TOKEN: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
     steps:
     - name: Generate access token
       id: generate_token
-      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
+      if: env.HAS_APP_TOKEN == 'true'
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
@@ -33,7 +35,7 @@ jobs:
 
     - name: Generate access token (archive)
       id: generate_archive_token
-      if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
+      if: env.HAS_APP_TOKEN == 'true'
       uses: tibdex/github-app-token@v2
       with:
         app_id: ${{ secrets.GH_APP_ID }}
@@ -55,7 +57,7 @@ jobs:
 
     - name: Fetch keystore
       id: fetch_keystore
-      if: ${{ steps.generate_token.outputs.token != '' }}
+      if: steps.generate_token.outputs.token != ''
       run: |
         TMP_KEYSTORE_FILE_PATH="${RUNNER_TEMP}"/keystore
         mkdir -p "${TMP_KEYSTORE_FILE_PATH}"
@@ -84,18 +86,18 @@ jobs:
         ANILIST_KEY: ${{ secrets.ANILIST_KEY }}
 
     - uses: actions/checkout@v6
-      if: ${{ steps.generate_archive_token.outputs.token != '' }}
+      if: steps.generate_archive_token.outputs.token != ''
       with:
         repository: "recloudstream/cloudstream-archive"
         token: ${{ steps.generate_archive_token.outputs.token }}
         path: "archive"
 
     - name: Move build
-      if: ${{ steps.generate_archive_token.outputs.token != '' }}
+      if: steps.generate_archive_token.outputs.token != ''
       run: cp app/build/outputs/apk/prerelease/release/*.apk "archive/$(git rev-parse --short HEAD).apk"
 
     - name: Push archive
-      if: ${{ steps.generate_archive_token.outputs.token != '' }}
+      if: steps.generate_archive_token.outputs.token != ''
       run: |
         cd $GITHUB_WORKSPACE/archive
         git config --local user.email "actions@github.com"

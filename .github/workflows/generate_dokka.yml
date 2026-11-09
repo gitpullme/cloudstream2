@@ -16,10 +16,12 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP_TOKEN: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
     steps:
       - name: Generate access token
         id: generate_token
-        if: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_KEY != '' }}
+        if: env.HAS_APP_TOKEN == 'true'
         uses: tibdex/github-app-token@v2
         with:
           app_id: ${{ secrets.GH_APP_ID }}
@@ -34,7 +36,7 @@ jobs:
           path: "src"
 
       - name: Checkout dokka
-        if: ${{ steps.generate_token.outputs.token != '' }}
+        if: steps.generate_token.outputs.token != ''
         uses: actions/checkout@v6
         with:
           repository: "recloudstream/dokka"
@@ -42,7 +44,7 @@ jobs:
           token: ${{ steps.generate_token.outputs.token }}
 
       - name: Clean old builds
-        if: ${{ steps.generate_token.outputs.token != '' }}
+        if: steps.generate_token.outputs.token != ''
         run: |
           cd $GITHUB_WORKSPACE/dokka/
           rm -rf "./app"
@@ -66,11 +68,11 @@ jobs:
           ./gradlew docs:dokkaGeneratePublicationHtml
 
       - name: Copy Dokka
-        if: ${{ steps.generate_token.outputs.token != '' }}
+        if: steps.generate_token.outputs.token != ''
         run: cp -r $GITHUB_WORKSPACE/src/docs/build/dokka/html/* $GITHUB_WORKSPACE/dokka/
 
       - name: Push builds
-        if: ${{ steps.generate_token.outputs.token != '' }}
+        if: steps.generate_token.outputs.token != ''
         run: |
           cd $GITHUB_WORKSPACE/dokka
           touch .nojekyll
