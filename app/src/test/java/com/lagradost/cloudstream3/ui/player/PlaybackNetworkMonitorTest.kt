@@ -33,7 +33,18 @@ class PlaybackNetworkMonitorTest {
         DataSpec(Uri.parse(uriStr))
 
     @Test
-    fun `completed network transfers update throughput in bits per second`() {
+    fun `no network history returns NetworkState UNKNOWN`() {
+        val monitor = PlaybackNetworkMonitor()
+        val snapshot = monitor.snapshot()
+
+        assertEquals(0, snapshot.samples)
+        assertEquals(0L, snapshot.throughputBps)
+        assertEquals(NetworkState.UNKNOWN, snapshot.state)
+        assertEquals(0f, snapshot.confidence, 0.001f)
+    }
+
+    @Test
+    fun `completed network transfers update throughput in bits per second and report HEALTHY`() {
         val clock = FakeClock()
         val monitor = PlaybackNetworkMonitor(clock = { clock.currentTimeMs })
         val source = FakeDataSource("video1")
@@ -44,7 +55,7 @@ class PlaybackNetworkMonitorTest {
         monitor.onTransferStart(source, spec, isNetwork = true)
         clock.advance(50)
 
-        // 500 KB transferred in 400ms
+        // 500 KB transferred in 400ms -> approx 10 Mbps
         val totalBytes = 500 * 1024
         monitor.onBytesTransferred(source, spec, isNetwork = true, bytesTransferred = totalBytes)
         clock.advance(400)
@@ -52,9 +63,30 @@ class PlaybackNetworkMonitorTest {
 
         val snapshot = monitor.snapshot()
         assertEquals(1, snapshot.samples)
-        // Rate must be positive and in bits per second
-        assertTrue(snapshot.throughputBps > 0L)
+        assertTrue(snapshot.throughputBps > 5_000_000L)
         assertTrue(snapshot.peakThroughputBps >= snapshot.throughputBps)
+        assertEquals(NetworkState.HEALTHY, snapshot.state)
+    }
+
+    @Test
+    fun `slow connection is classified as DEGRADED`() {
+        val clock = FakeClock()
+        val monitor = PlaybackNetworkMonitor(clock = { clock.currentTimeMs })
+        val source = FakeDataSource("slow1")
+        val spec = dataSpec()
+
+        // 32 KB transferred in 1000ms -> approx 256 kbps (slow)
+        monitor.onTransferInitializing(source, spec, isNetwork = true)
+        clock.advance(50)
+        monitor.onTransferStart(source, spec, isNetwork = true)
+        clock.advance(50)
+        monitor.onBytesTransferred(source, spec, isNetwork = true, bytesTransferred = 32 * 1024)
+        clock.advance(1000)
+        monitor.onTransferEnd(source, spec, isNetwork = true)
+
+        val snapshot = monitor.snapshot()
+        assertEquals(1, snapshot.samples)
+        assertEquals(NetworkState.DEGRADED, snapshot.state)
     }
 
     @Test
@@ -64,7 +96,6 @@ class PlaybackNetworkMonitorTest {
         val source = FakeDataSource("cached_source")
         val spec = dataSpec()
 
-        // Report as cache read (isNetwork = false)
         monitor.onTransferInitializing(source, spec, isNetwork = false)
         clock.advance(50)
         monitor.onTransferStart(source, spec, isNetwork = false)
@@ -77,10 +108,11 @@ class PlaybackNetworkMonitorTest {
         assertEquals(0, snapshot.samples)
         assertEquals(0L, snapshot.throughputBps)
         assertEquals(0L, snapshot.peakThroughputBps)
+        assertEquals(NetworkState.UNKNOWN, snapshot.state)
     }
 
     @Test
-    fun `active stalled request lowers effective throughput prediction`() {
+    fun `active stalled request switches to NetworkState STALLED`() {
         val clock = FakeClock()
         val monitor = PlaybackNetworkMonitor(clock = { clock.currentTimeMs })
         val source1 = FakeDataSource("fast1")
@@ -96,10 +128,9 @@ class PlaybackNetworkMonitorTest {
         monitor.onTransferEnd(source1, spec1, isNetwork = true)
 
         val initialSnapshot = monitor.snapshot()
-        val initialRate = initialSnapshot.throughputBps
-        assertTrue(initialRate > 1_000_000L)
+        assertEquals(NetworkState.HEALTHY, initialSnapshot.state)
 
-        // 2. Start a second request that receives very few bytes and stalls
+        // 2. Start a second request that receives few bytes and stalls for 5 seconds
         val stalledSource = FakeDataSource("stalled")
         val stalledSpec = dataSpec("https://cdn.example.com/stalled.ts")
 
@@ -109,13 +140,83 @@ class PlaybackNetworkMonitorTest {
         clock.advance(50)
         monitor.onBytesTransferred(stalledSource, stalledSpec, isNetwork = true, bytesTransferred = 1024)
 
-        // Advance clock by 10 seconds to simulate request stalling
-        clock.advance(10_000)
+        clock.advance(5_000)
 
-        // When stalled request is active, snapshot takes in-flight throughput into account
-        val postStallSnapshot = monitor.snapshot()
-        assertTrue(postStallSnapshot.samples >= 1)
-        assertTrue(postStallSnapshot.throughputBps < initialRate)
+        val stalledSnapshot = monitor.snapshot()
+        assertEquals(NetworkState.STALLED, stalledSnapshot.state)
+        assertTrue(stalledSnapshot.longestStallMs >= 2500L)
+
+        // Ending the stalled request clears the stall condition
+        monitor.onTransferEnd(stalledSource, stalledSpec, isNetwork = true)
+        val postEndSnapshot = monitor.snapshot()
+        assertFalse(postEndSnapshot.state == NetworkState.STALLED)
+    }
+
+    @Test
+    fun `connection failure reports OFFLINE and recovery returns to normal`() {
+        val clock = FakeClock()
+        val monitor = PlaybackNetworkMonitor(clock = { clock.currentTimeMs })
+        val source = FakeDataSource("errSource")
+        val spec = dataSpec()
+
+        monitor.onTransferInitializing(source, spec, isNetwork = true)
+        monitor.onTransferError(source, spec, isNetwork = true)
+
+        val offlineSnapshot = monitor.snapshot()
+        assertEquals(NetworkState.OFFLINE, offlineSnapshot.state)
+
+        monitor.recordConnectionRecovery()
+        val recoveredSnapshot = monitor.snapshot()
+        assertFalse(recoveredSnapshot.state == NetworkState.OFFLINE)
+    }
+
+    @Test
+    fun `concurrent sessions with different bandwidth remain strictly isolated`() {
+        val clock = FakeClock()
+        val monitorFast = PlaybackNetworkMonitor(sessionId = "fastSession", clock = { clock.currentTimeMs })
+        val monitorSlow = PlaybackNetworkMonitor(sessionId = "slowSession", clock = { clock.currentTimeMs })
+
+        val srcFast = FakeDataSource("fast")
+        val srcSlow = FakeDataSource("slow")
+
+        // Fast transfer on monitorFast (10 MB in 200ms -> 400 Mbps)
+        monitorFast.onTransferInitializing(srcFast, dataSpec(), isNetwork = true)
+        monitorFast.onTransferStart(srcFast, dataSpec(), isNetwork = true)
+        monitorFast.onBytesTransferred(srcFast, dataSpec(), isNetwork = true, bytesTransferred = 10 * 1024 * 1024)
+        clock.advance(200)
+        monitorFast.onTransferEnd(srcFast, dataSpec(), isNetwork = true)
+
+        // Slow transfer on monitorSlow (64 KB in 1000ms -> 512 Kbps)
+        monitorSlow.onTransferInitializing(srcSlow, dataSpec(), isNetwork = true)
+        monitorSlow.onTransferStart(srcSlow, dataSpec(), isNetwork = true)
+        monitorSlow.onBytesTransferred(srcSlow, dataSpec(), isNetwork = true, bytesTransferred = 64 * 1024)
+        clock.advance(1000)
+        monitorSlow.onTransferEnd(srcSlow, dataSpec(), isNetwork = true)
+
+        val snapFast = monitorFast.snapshot()
+        val snapSlow = monitorSlow.snapshot()
+
+        assertTrue(snapFast.throughputBps > 100_000_000L)
+        assertTrue(snapSlow.throughputBps < 1_000_000L)
+        assertEquals(NetworkState.HEALTHY, snapFast.state)
+        assertEquals(NetworkState.DEGRADED, snapSlow.state)
+    }
+
+    @Test
+    fun `aborted requests are cleaned up cleanly without leaking state`() {
+        val clock = FakeClock()
+        val monitor = PlaybackNetworkMonitor(clock = { clock.currentTimeMs })
+        val source = FakeDataSource("aborted")
+        val spec = dataSpec()
+
+        monitor.onTransferInitializing(source, spec, isNetwork = true)
+        monitor.onTransferStart(source, spec, isNetwork = true)
+        monitor.onBytesTransferred(source, spec, isNetwork = true, bytesTransferred = 32 * 1024)
+
+        assertEquals(1, monitor.snapshot().activeRequests)
+
+        monitor.onTransferAborted(source, spec, isNetwork = true)
+        assertEquals(0, monitor.snapshot().activeRequests)
     }
 
     @Test
@@ -133,7 +234,6 @@ class PlaybackNetworkMonitorTest {
         clock.advance(200)
         monitor.onTransferEnd(source1, spec1, isNetwork = true)
 
-        // Second request has a gap between first request end and second request init (400ms gap)
         clock.advance(400)
         val source2 = FakeDataSource("req2")
         val spec2 = dataSpec()
@@ -147,7 +247,6 @@ class PlaybackNetworkMonitorTest {
 
         val snapshot = monitor.snapshot()
         assertEquals(2, snapshot.samples)
-        // Scheduling gap is non-negative and separate from body transfer
         assertTrue(snapshot.lastTransferMs >= 0L)
     }
 
@@ -171,7 +270,6 @@ class PlaybackNetworkMonitorTest {
                     monitor.onBytesTransferred(src, spec, isNetwork = true, bytesTransferred = 64 * 1024)
                     clock.addAndGet(200L)
 
-                    // Even workers complete normally; odd workers are interrupted/abandoned without onTransferEnd
                     if (i % 2 == 0) {
                         monitor.onTransferEnd(src, spec, isNetwork = true)
                     }

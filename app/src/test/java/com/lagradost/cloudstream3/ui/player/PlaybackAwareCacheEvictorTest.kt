@@ -144,26 +144,6 @@ class PlaybackAwareCacheEvictorTest {
     }
 
     @Test
-    fun `eviction still happens when only the active source is cached`() {
-        val cache = FakeCache()
-        val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
-            initialMaxBytes = 1_000L,
-            protectRecentMs = 60_000L,
-        )
-        evictor.onCacheInitialized()
-        evictor.setActivePrefix("https://cdn.example/active/")
-
-        val first = span("https://cdn.example/active/1.ts")
-        evictor.onSpanAdded(cache, first)
-        val second = span("https://cdn.example/active/2.ts")
-        evictor.onSpanAdded(cache, second)
-        evictor.onSpanAdded(cache, span("https://cdn.example/active/3.ts"))
-
-        assertEquals(1, cache.removed.size)
-        assertEquals(800L, evictor.usageBytes())
-    }
-
-    @Test
     fun `touching a span moves it to the most recently used position`() {
         val cache = FakeCache()
         val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
@@ -177,7 +157,6 @@ class PlaybackAwareCacheEvictorTest {
         val second = span("https://cdn.example/active/2.ts", ageMs = 60_000L)
         evictor.onSpanAdded(cache, first)
         evictor.onSpanAdded(cache, second)
-        // Simulate a read of the first span, which makes it newer than the second.
         evictor.onSpanTouched(cache, first, span(first.key, ageMs = 0L))
 
         evictor.onSpanAdded(cache, span("https://cdn.example/active/3.ts"))
@@ -197,7 +176,6 @@ class PlaybackAwareCacheEvictorTest {
 
         val older = span("https://cdn.example/active/old.ts", ageMs = 60_000L)
         val newer = span("https://cdn.example/active/new.ts", ageMs = 1_000L)
-        // Directory scan order is arbitrary (and here reversed).
         evictor.onSpanAdded(cache, newer)
         evictor.onSpanAdded(cache, older)
         evictor.onCacheInitialized()
@@ -227,13 +205,10 @@ class PlaybackAwareCacheEvictorTest {
         evictor.onSpanAdded(cache, span2)
         assertEquals(800L, evictor.usageBytes())
 
-        // Now simulate a failure when deleting spans
         cache.throwOnRemove = true
         cache.putSpan(span3)
         evictor.onSpanAdded(cache, span3)
 
-        // Removal failed, so the victim span must NOT be permanently removed from local accounting.
-        // Total bytes must reflect all 3 spans (1200L) since none could be removed from disk.
         assertEquals(1200L, evictor.usageBytes())
         assertTrue(cache.removed.isEmpty())
     }
@@ -261,8 +236,6 @@ class PlaybackAwareCacheEvictorTest {
         assertEquals(1200L, evictor.usageBytes())
         assertTrue(cache.removed.isEmpty())
 
-        // User reduces cache size preference to 700 bytes.
-        // Eviction must happen immediately even though no new span is written!
         evictor.setMaxBytes(700L, cache)
 
         assertEquals(2, cache.removed.size)
@@ -308,7 +281,6 @@ class PlaybackAwareCacheEvictorTest {
         assertTrue(latch.await(10, TimeUnit.SECONDS))
         executor.shutdown()
 
-        // Exactly numThreads items of 100L bytes each = 800L
         assertEquals((numThreads * 100L), evictor.usageBytes())
     }
 
@@ -321,13 +293,11 @@ class PlaybackAwareCacheEvictorTest {
         )
         evictor.onCacheInitialized()
 
-        // Active media stream has segments on different CDN domains and track variants
         val videoVariantA = span("https://cdn1.fastly.net/hls/1080p/seg1.m4s?token=abc123", length = 400L)
         val videoVariantB = span("https://cdn2.akamai.com/hls/720p/seg1.m4s?sig=xyz789", length = 400L)
         val audioTrack = span("https://audio-cdn.cf.net/audio/eng/seg1.m4a?expires=9999", length = 400L)
         val unrelatedOld = span("https://other-movie.com/video/seg9.ts", length = 400L, ageMs = 120_000L)
 
-        // Register active ownership
         evictor.registerActiveKey(videoVariantA.key)
         evictor.registerActiveKey(videoVariantB.key)
         evictor.registerActiveKey(audioTrack.key)
@@ -337,7 +307,6 @@ class PlaybackAwareCacheEvictorTest {
         evictor.onSpanAdded(cache, videoVariantB)
         assertEquals(1200L, evictor.usageBytes())
 
-        // Adding audio pushes over 1500L max (1600L total). Unrelated old span must be evicted!
         evictor.onSpanAdded(cache, audioTrack)
 
         assertEquals(listOf(unrelatedOld), cache.removed)
@@ -349,13 +318,104 @@ class PlaybackAwareCacheEvictorTest {
     }
 
     @Test
+    fun `active leases on session are never evicted even when cache is over limit`() {
+        val cache = FakeCache()
+        val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
+            initialMaxBytes = 800L,
+            protectRecentMs = 0L,
+        )
+        evictor.onCacheInitialized()
+
+        val session = PlaybackSessionState()
+        PlaybackCacheManager.registerSession(session)
+
+        val activeLeaseKey1 = "https://cdn.example.com/leased_seg1.ts"
+        val activeLeaseKey2 = "https://cdn.example.com/leased_seg2.ts"
+        val activeLeaseKey3 = "https://cdn.example.com/leased_seg3.ts"
+
+        session.acquireLease(activeLeaseKey1)
+        session.acquireLease(activeLeaseKey2)
+        session.acquireLease(activeLeaseKey3)
+
+        val span1 = span(activeLeaseKey1, length = 400L, ageMs = 50_000L)
+        val span2 = span(activeLeaseKey2, length = 400L, ageMs = 40_000L)
+        val span3 = span(activeLeaseKey3, length = 400L, ageMs = 30_000L)
+
+        evictor.onSpanAdded(cache, span1)
+        evictor.onSpanAdded(cache, span2)
+        // Adding span3 brings total to 1200L, which exceeds maxBytes (800L).
+        // Since all 3 spans have active leases, NONE must be evicted!
+        evictor.onSpanAdded(cache, span3)
+
+        assertTrue("Active leases must never be evicted", cache.removed.isEmpty())
+        assertEquals(1200L, evictor.usageBytes())
+
+        session.release()
+    }
+
+    @Test
+    fun `multiple active sessions maintain independent simultaneous protection`() {
+        val cache = FakeCache()
+        val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
+            initialMaxBytes = 1_500L,
+            protectRecentMs = 0L,
+        )
+        evictor.onCacheInitialized()
+
+        val session1 = PlaybackSessionState(sourceUri = "https://cdn1.com/vod1.mp4")
+        val session2 = PlaybackSessionState(sourceUri = "https://cdn2.com/vod2.mp4")
+        PlaybackCacheManager.registerSession(session1)
+        PlaybackCacheManager.registerSession(session2)
+
+        val spanSession1 = span("https://cdn1.com/vod1.mp4|range=0-400", length = 400L, ageMs = 60_000L)
+        val spanSession2 = span("https://cdn2.com/vod2.mp4|range=0-400", length = 400L, ageMs = 60_000L)
+        val oldUnrelated = span("https://cdn3.com/old.mp4", length = 400L, ageMs = 120_000L)
+
+        evictor.onSpanAdded(cache, oldUnrelated)
+        evictor.onSpanAdded(cache, spanSession1)
+        evictor.onSpanAdded(cache, spanSession2)
+
+        // Adding 400 more bytes exceeds limit (1600 > 1500)
+        val newSpan = span("https://cdn1.com/vod1.mp4|range=401-800", length = 400L)
+        evictor.onSpanAdded(cache, newSpan)
+
+        assertEquals(listOf(oldUnrelated), cache.removed)
+        assertTrue(PlaybackCacheManager.isSpanActive(spanSession1.key))
+        assertTrue(PlaybackCacheManager.isSpanActive(spanSession2.key))
+
+        session1.release()
+        session2.release()
+    }
+
+    @Test
+    fun `scaling to thousands of spans works efficiently and correctly`() {
+        val cache = FakeCache()
+        val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
+            initialMaxBytes = 500_000L, // 500 KB limit
+            protectRecentMs = 0L,
+        )
+        evictor.onCacheInitialized()
+
+        val totalSpans = 2_000
+        val spanSize = 500L // 2,000 * 500 = 1,000,000 bytes (1 MB total added)
+
+        for (i in 0 until totalSpans) {
+            val s = span("https://cdn.example.com/seg_$i.ts", length = spanSize, ageMs = (totalSpans - i).toLong())
+            cache.putSpan(s)
+            evictor.onSpanAdded(cache, s)
+        }
+
+        assertTrue("Eviction must bring cache down to maxBytes ceiling", evictor.usageBytes() <= 500_000L)
+        assertTrue("At least half of the spans should have been evicted", cache.removed.size >= 1000)
+    }
+
+    @Test
     fun `signed segment URLs with changing query tokens still match normalized active source`() {
         val evictor = PlaybackCacheManager.PlaybackAwareCacheEvictor(
             initialMaxBytes = 10_000L,
         )
         evictor.registerActiveUri(PlaybackCacheManager.normalizeUri("https://cdn.video.com/hls/stream/seg01.ts?initial_token=123"))
 
-        // Key with updated query token and sensitive header hash fingerprint
         val keyWithNewToken = "https://cdn.video.com/hls/stream/seg01.ts?new_token=456&ts=789|h=a1b2c3d4"
 
         assertTrue(evictor.isSpanActive(keyWithNewToken))

@@ -8,6 +8,7 @@ import androidx.preference.PreferenceManager
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.mvvm.logError
+import com.lagradost.cloudstream3.ui.player.PlaybackCacheManager
 import com.lagradost.cloudstream3.ui.BasePreferenceFragmentCompat
 import com.lagradost.cloudstream3.ui.player.source_priority.QualityProfileDialog
 import com.lagradost.cloudstream3.ui.settings.Globals.EMULATOR
@@ -318,7 +319,10 @@ class SettingsPlayer : BasePreferenceFragmentCompat() {
 
             pref.setOnPreferenceClickListener {
                 try {
-                    cacheDir.deleteRecursively()
+                    PlaybackCacheManager.clearAll()
+                    context?.let { ctx ->
+                        coil3.SingletonImageLoader.get(ctx).diskCache?.clear()
+                    }
                     updateSummary()
                 } catch (e: Exception) {
                     logError(e)

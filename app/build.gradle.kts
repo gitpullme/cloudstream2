@@ -85,17 +85,36 @@ android {
     }
 
     signingConfigs {
-        // We just use SIGNING_KEY_ALIAS here since it won't change
-        // so won't kill the configuration cache.
-        if (System.getenv("SIGNING_KEY_ALIAS") != null) {
-            create("prerelease") {
-                val tmpFilePath = System.getProperty("user.home") + "/work/_temp/keystore/"
-                val prereleaseStoreFile: File? = File(tmpFilePath).listFiles()?.first()
+        val keyAliasEnv = System.getenv("SIGNING_KEY_ALIAS")
+        val keyPasswordEnv = System.getenv("SIGNING_KEY_PASSWORD")
+        val storePasswordEnv = System.getenv("SIGNING_STORE_PASSWORD")
+        val storeFilePathEnv = System.getenv("SIGNING_STORE_FILE")
 
-                storeFile = prereleaseStoreFile?.let { file(it) }
-                storePassword = System.getenv("SIGNING_STORE_PASSWORD")
-                keyAlias = System.getenv("SIGNING_KEY_ALIAS")
-                keyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+        val runnerTemp = System.getenv("RUNNER_TEMP")
+        val fallbackDir = runnerTemp?.let { "$it/keystore" }
+            ?: (System.getProperty("user.home") + "/work/_temp/keystore")
+
+        val keystoreFile = when {
+            !storeFilePathEnv.isNullOrBlank() -> File(storeFilePathEnv)
+            File(fallbackDir, "prerelease_keystore.keystore").exists() -> File(fallbackDir, "prerelease_keystore.keystore")
+            else -> File(fallbackDir).listFiles()?.firstOrNull { it.isFile && (it.extension == "keystore" || it.extension == "jks") }
+        }
+
+        if (
+            !keyAliasEnv.isNullOrBlank() &&
+            !keyPasswordEnv.isNullOrBlank() &&
+            !storePasswordEnv.isNullOrBlank() &&
+            keystoreFile != null &&
+            keystoreFile.exists() &&
+            keystoreFile.isFile &&
+            keystoreFile.canRead() &&
+            keystoreFile.length() > 0L
+        ) {
+            create("prerelease") {
+                storeFile = keystoreFile
+                storePassword = storePasswordEnv
+                keyAlias = keyAliasEnv
+                keyPassword = keyPasswordEnv
             }
         }
     }

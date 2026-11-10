@@ -3,6 +3,7 @@ package com.lagradost.cloudstream3.ui.player
 import android.net.Uri
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -21,8 +22,11 @@ class CacheRoutingDataSourceTest {
         var isClosed = false
         var openedDataSpec: DataSpec? = null
         var readCount = 0
+        val listeners = mutableListOf<TransferListener>()
 
-        override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) = Unit
+        override fun addTransferListener(transferListener: TransferListener) {
+            listeners.add(transferListener)
+        }
 
         override fun open(dataSpec: DataSpec): Long {
             if (throwOnOpen) {
@@ -72,7 +76,6 @@ class CacheRoutingDataSourceTest {
 
         val ds = routingFactory.createDataSource()
 
-        // Media segment request with FLAG_ALLOW_GZIP set
         val spec = DataSpec.Builder()
             .setUri(Uri.parse("https://cdn.example.com/hls/video_1080p_001.ts"))
             .setFlags(DataSpec.FLAG_ALLOW_GZIP)
@@ -80,7 +83,6 @@ class CacheRoutingDataSourceTest {
 
         ds.open(spec)
 
-        // Must route through cache factory, not upstream!
         assertEquals(1, cacheFactory.createCount)
         assertEquals(0, upstreamFactory.createCount)
         assertTrue(cacheSource.isOpen)
@@ -111,7 +113,14 @@ class CacheRoutingDataSourceTest {
         assertEquals(1, upstreamFactory.createCount)
         ds.close()
 
-        // 2. POST request (e.g. DRM license exchange)
+        // 2. Extensionless manifest
+        val extensionlessManifest = DataSpec(Uri.parse("https://cdn.example.com/stream/manifest"))
+        ds.open(extensionlessManifest)
+        assertEquals(0, cacheFactory.createCount)
+        assertEquals(2, upstreamFactory.createCount)
+        ds.close()
+
+        // 3. POST request (e.g. DRM license exchange)
         val postSpec = DataSpec.Builder()
             .setUri(Uri.parse("https://license.drm.example/acquire"))
             .setHttpMethod(DataSpec.HTTP_METHOD_POST)
@@ -120,8 +129,92 @@ class CacheRoutingDataSourceTest {
 
         ds.open(postSpec)
         assertEquals(0, cacheFactory.createCount)
-        assertEquals(2, upstreamFactory.createCount)
+        assertEquals(3, upstreamFactory.createCount)
         ds.close()
+    }
+
+    @Test
+    fun `session lease is acquired on open and released on close`() {
+        val cacheSource = MockDataSource()
+        val upstreamSource = MockDataSource()
+        val cacheFactory = MockFactory(cacheSource)
+        val upstreamFactory = MockFactory(upstreamSource)
+        val session = PlaybackSessionState()
+
+        val routingFactory = CacheRoutingDataSourceFactory(
+            cacheFactory = cacheFactory,
+            upstreamFactory = upstreamFactory,
+            session = session,
+        )
+
+        val ds = routingFactory.createDataSource()
+        val spec = DataSpec(Uri.parse("https://cdn.example.com/segment_42.ts"))
+
+        assertEquals(0, session.getActiveLeasedKeys().size)
+
+        ds.open(spec)
+        assertTrue(session.isKeyLeased("https://cdn.example.com/segment_42.ts"))
+
+        ds.close()
+        assertFalse(session.isKeyLeased("https://cdn.example.com/segment_42.ts"))
+    }
+
+    @Test
+    fun `failed open releases session lease immediately`() {
+        val failingSource = MockDataSource(throwOnOpen = true)
+        val cacheFactory = MockFactory(failingSource)
+        val upstreamFactory = MockFactory(MockDataSource())
+        val session = PlaybackSessionState()
+
+        val routingFactory = CacheRoutingDataSourceFactory(
+            cacheFactory = cacheFactory,
+            upstreamFactory = upstreamFactory,
+            session = session,
+        )
+
+        val ds = routingFactory.createDataSource()
+        val spec = DataSpec(Uri.parse("https://cdn.example.com/segment_99.ts"))
+
+        try {
+            ds.open(spec)
+            fail("Expected open to throw")
+        } catch (_: IOException) {
+            // Expected
+        }
+
+        assertFalse("Lease must not remain active after open throws", session.isKeyLeased("https://cdn.example.com/segment_99.ts"))
+        ds.close()
+    }
+
+    @Test
+    fun `per-session live state causes only the live session to bypass cache`() {
+        val cacheSource = MockDataSource()
+        val upstreamSource = MockDataSource()
+        val cacheFactory = MockFactory(cacheSource)
+        val upstreamFactory = MockFactory(upstreamSource)
+
+        val vodSession = PlaybackSessionState(isLive = false)
+        val liveSession = PlaybackSessionState(isLive = true)
+
+        val vodRouting = CacheRoutingDataSourceFactory(cacheFactory, upstreamFactory, vodSession)
+        val liveRouting = CacheRoutingDataSourceFactory(cacheFactory, upstreamFactory, liveSession)
+
+        val vodDs = vodRouting.createDataSource()
+        val liveDs = liveRouting.createDataSource()
+
+        val mediaSpec = DataSpec(Uri.parse("https://cdn.example.com/chunk_001.ts"))
+
+        // VOD session uses cache
+        vodDs.open(mediaSpec)
+        assertEquals(1, cacheFactory.createCount)
+        assertEquals(0, upstreamFactory.createCount)
+        vodDs.close()
+
+        // Live session bypasses cache directly to upstream
+        liveDs.open(mediaSpec)
+        assertEquals(1, cacheFactory.createCount)
+        assertEquals(1, upstreamFactory.createCount)
+        liveDs.close()
     }
 
     @Test
@@ -139,7 +232,6 @@ class CacheRoutingDataSourceTest {
         val ds = routingFactory.createDataSource()
         val spec = DataSpec(Uri.parse("https://cdn.example.com/video.mp4"))
 
-        // 1. Failed open throws IOException
         try {
             ds.open(spec)
             fail("Expected open to throw IOException")
@@ -147,17 +239,14 @@ class CacheRoutingDataSourceTest {
             // Expected
         }
 
-        // Caller must be able to call close() without crashing even after failed open
         ds.close()
 
-        // 2. Repeated open on the same DataSource works cleanly
         failingCacheSource.throwOnOpen = false
         failingCacheSource.throwOnRead = true
         val length = ds.open(spec)
         assertTrue(length > 0)
         assertTrue(failingCacheSource.isOpen)
 
-        // 3. Exception during read throws and then close() cleans up
         try {
             val buf = ByteArray(16)
             ds.read(buf, 0, 16)
@@ -181,13 +270,10 @@ class CacheRoutingDataSourceTest {
         val spec = DataSpec(Uri.parse("https://cdn.example.com/video/seg.ts"))
         val key = factory.buildCacheKey(spec)
 
-        // The key must NOT contain the sensitive auth tokens in plaintext
         assertFalse(key.contains("secret_user_token_12345"))
         assertFalse(key.contains("secret_session_cookie_abcde"))
-        // It must contain the hashed representation
         assertTrue(key.contains("|h="))
 
-        // Changing the authorization token changes the hash fingerprint
         val differentTokenHeaders = mapOf(
             "Authorization" to "Bearer different_token_99999",
             "Cookie" to "session=secret_session_cookie_abcde",

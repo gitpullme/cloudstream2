@@ -17,6 +17,7 @@ import androidx.annotation.MainThread
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AlertDialog
 import androidx.core.net.toUri
+import android.os.SystemClock
 import androidx.media3.common.C.TIME_UNSET
 import androidx.media3.common.C.TRACK_TYPE_AUDIO
 import androidx.media3.common.C.TRACK_TYPE_TEXT
@@ -136,6 +137,8 @@ class CS3IPlayer : IPlayer {
     private var playerListener: Player.Listener? = null
     private var isPlaying = false
     private var activeLoadControl: ProactiveLoadControl? = null
+    private var activeSession: PlaybackSessionState? = null
+    private var userSelectedVideoTrackId: String? = null
 
     private var exoPlayer: ExoPlayer? = null
         set(value) {
@@ -371,6 +374,7 @@ class CS3IPlayer : IPlayer {
     }
 
     override fun setMaxVideoSize(width: Int, height: Int, id: String?) {
+        userSelectedVideoTrackId = id
         if (id != null) {
             val videoTrack =
                 exoPlayer?.currentTracks?.groups?.filter { it.type == TRACK_TYPE_VIDEO }
@@ -639,9 +643,11 @@ class CS3IPlayer : IPlayer {
             release()
         }
         // Media3 normally calls LoadControl.onReleased, but the public player is dropped here.
-        // Make cleanup explicit so component callbacks cannot leak across player recreation.
+        // Make cleanup explicit so component callbacks and cache leases cannot leak across player recreation.
+        val session = activeSession
+        activeSession = null
+        session?.release()
         loadControl?.release()
-        PlaybackCacheManager.clearActiveSource()
 
         exoPlayer = null
         event(PlayerAttachedEvent(null))
@@ -1092,6 +1098,30 @@ class CS3IPlayer : IPlayer {
         /** External audio tracks to merge with the video */
         audioSources: List<MediaSource> = emptyList()
     ): ExoPlayer {
+        val firstSourceUri = if (onlineSource == null) {
+            null
+        } else {
+            mediaItemSlices.firstOrNull()
+                ?.mediaItem?.localConfiguration?.uri?.toString()
+        }
+        val firstMime = mediaItemSlices.firstOrNull()
+            ?.mediaItem?.localConfiguration?.mimeType
+        val isPlaylist = firstMime == MimeTypes.APPLICATION_M3U8 ||
+            firstMime == MimeTypes.APPLICATION_MPD ||
+            firstSourceUri?.substringBefore('?')
+                ?.substringBefore('#')
+                ?.endsWith(".m3u8", ignoreCase = true) == true ||
+            firstSourceUri?.substringBefore('?')
+                ?.substringBefore('#')
+                ?.endsWith(".mpd", ignoreCase = true) == true
+
+        val session = PlaybackSessionState(
+            sourceUri = firstSourceUri,
+            isLive = false,
+        ).apply {
+            setSource(firstSourceUri, isPlaylistSource = isPlaylist, live = false)
+        }.also { activeSession = it }
+
         val exoPlayerBuilder =
             ExoPlayer.Builder(context)
                 .setMediaSourceFactory(
@@ -1264,6 +1294,24 @@ class CS3IPlayer : IPlayer {
                         context = context,
                         videoBufferMs = videoBufferMs,
                         targetBufferBytes = cacheSize,
+                        session = session,
+                        onQualityDegradationAdvised = { sustainableBps ->
+                            try {
+                                val selector = exoPlayer?.trackSelector as? DefaultTrackSelector
+                                if (selector != null && userSelectedVideoTrackId == null) {
+                                    val now = SystemClock.elapsedRealtime()
+                                    if (now - session.lastQualitySwitchRealtimeMs >= 10_000L) {
+                                        session.lastQualitySwitchRealtimeMs = now
+                                        selector.parameters = selector.buildUponParameters()
+                                            .setMaxVideoBitrate(sustainableBps.toInt().coerceAtLeast(250_000))
+                                            .build()
+                                        Log.i(TAG, "Adaptive quality fallback applied: maxVideoBitrate=${sustainableBps}bps")
+                                    }
+                                }
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "Failed to apply adaptive quality fallback", t)
+                            }
+                        }
                     ).also { activeLoadControl = it }
                 )
 
@@ -1305,31 +1353,17 @@ class CS3IPlayer : IPlayer {
                 CacheRoutingDataSourceFactory(
                     cacheFactory = cacheFactory,
                     upstreamFactory = upstream,
+                    session = session,
                     shouldBypass = { uri ->
-                        (loadControl?.isLiveStream() == true) || PlaybackCacheManager.shouldBypassCache(uri)
+                        (loadControl?.isLiveStream() == true) || PlaybackCacheManager.shouldBypassCache(uri, session)
                     },
                 )
             }
         }
 
         // Protect the active title's cache spans from eviction while it is being watched.
-        val firstSourceUri = if (onlineSource == null) {
-            null
-        } else {
-            mediaItemSlices.firstOrNull()
-                ?.mediaItem?.localConfiguration?.uri?.toString()
-        }
         if (firstSourceUri != null) {
-            val path = firstSourceUri.substringBefore('?').substringBefore('#')
-            val mime = mediaItemSlices.firstOrNull()
-                ?.mediaItem?.localConfiguration?.mimeType
-            val isPlaylist = mime == MimeTypes.APPLICATION_M3U8 ||
-                mime == MimeTypes.APPLICATION_MPD ||
-                path.endsWith(".m3u8", ignoreCase = true) ||
-                path.endsWith(".mpd", ignoreCase = true)
             PlaybackCacheManager.setActiveSource(firstSourceUri, directoryScope = isPlaylist)
-        } else {
-            PlaybackCacheManager.clearActiveSource()
         }
 
         val defaultMediaSourceFactory = if (dataSourceFactory != null) {

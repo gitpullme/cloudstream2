@@ -4,32 +4,22 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Pure, side-effect free forward-buffer policy used by [ProactiveLoadControl].
+ * Pure, side-effect free adaptive forward-buffer policy used by [ProactiveLoadControl].
  *
  * Media3's [androidx.media3.exoplayer.DefaultLoadControl] stops loading when the buffered duration
  * reaches `maxBufferMs` and only resumes when it falls below `minBufferMs`. CloudStream used to keep
  * `minBufferMs` at Media3's 50 s default while `maxBufferMs` came from the user's Video Buffer
  * Length (60-1800 s). That made long buffers drain almost completely before refilling.
  *
- * This policy fixes the threshold, but more importantly it does not treat a fixed percentage as
- * the whole answer:
- *
- * - The user's Video Buffer Length is always the *upper* target. It is never silently reduced by a
- *   nominal-bitrate guess.
- * - Memory is enforced separately through a device/allocator budget. Actual allocator bytes, not
- *   declared bitrate, stop loading when memory would become unsafe.
- * - Refill starts at a dynamic point (70-95% of the target) derived from the measured download
- *   throughput, its volatility and playback speed. On a slow or unstable connection it starts much
- *   earlier; on a fast stable connection it starts at 70%, never at Media3's fixed 50 s.
- * - A predictive calculation raises the refill point when the time needed to download the missing
- *   buffer (including TTFB and a safety margin) approaches the remaining playout runway.
- * - Byte-cap hysteresis, a critical recovery window and a memory-pressure mode prevent load
- *   oscillations and allow recovery after seeks or rebuffers.
- *
- * Everything here is independent of Android and Media3 so it can be unit tested on the JVM.
+ * This policy fixes the threshold and continuously adapts to network, memory and playback conditions:
+ * - Upper target respects the user's Video Buffer Length, clamped for live streams.
+ * - Allocator memory is enforced separately through a device-safe budget with hysteresis.
+ * - Refill starts early enough to prevent starvation before new media arrives.
+ * - Recovers quickly after seeks, rebuffers and stalls.
+ * - Detects unsustainable qualities and advises quality recovery.
  */
 object ForwardBufferPolicy {
-    /** Lowest adaptive refill point. Faster/stable links may stay below the old fixed 80% floor. */
+    /** Lowest adaptive refill point. Faster/stable links stay at or below this floor. */
     const val BASE_REFILL_FRACTION = 0.70
 
     /** Never start later than this fraction, regardless of how good the network looks. */
@@ -43,18 +33,17 @@ object ForwardBufferPolicy {
 
     /**
      * Hard safety ceiling as a multiple of the allocator budget. Even a critically empty buffer
-     * must not allocate past this, otherwise a misconfigured budget could OOM the app instead of
-     * simply stalling until the renderer frees memory.
+     * must not allocate past this to prevent OOM.
      */
     const val BYTE_PANIC_FRACTION = 1.5
 
-    /** Forward buffer below this is allowed to ignore the byte cap so playback can recover. */
+    /** Forward buffer below this is allowed to ignore the normal byte cap so playback can recover. */
     const val CRITICAL_BUFFER_MS = 2_000L
 
     /** Media3's default streaming target, used when the user selects "Automatic". */
     const val DEFAULT_MAX_BUFFER_MS = 50_000L
 
-    /** Largest selectable target (the UI offers up to 30 minutes); guards corrupt preferences. */
+    /** Largest selectable target (up to 30 minutes); guards corrupt preferences. */
     const val MAX_CONFIGURED_BUFFER_MS = 1_800_000L
 
     /** Live streams must not build an arbitrarily large forward buffer. */
@@ -63,22 +52,22 @@ object ForwardBufferPolicy {
     /** Smallest target we will ever hand to Media3. */
     const val MIN_TARGET_MS = 2_000L
 
-    /** Media3 1.9.3's default video + audio allocator budget (about 137.5 MiB). */
+    /** Media3 default video + audio allocator budget (about 137.5 MiB). */
     const val DEFAULT_MEMORY_BUDGET_BYTES = 144_179_200L
 
     /** Conservative allocator budget for low-RAM devices (48 MiB). */
     const val LOW_RAM_MEMORY_BUDGET_BYTES = 48L * 1024L * 1024L
 
-    /** Never configure an allocator smaller than this; the UI's smallest explicit value is 10 MiB. */
+    /** Never configure an allocator smaller than this. */
     const val MIN_MEMORY_BUDGET_BYTES = 8L * 1024L * 1024L
 
-    /** Upper bound for user-selected RAM on a normal device (a safe allocator ceiling). */
+    /** Upper bound for user-selected RAM on a normal device. */
     const val MAX_MEMORY_BUDGET_BYTES = 384L * 1024L * 1024L
 
     /** Upper bound for user-selected RAM on a low-RAM device. */
     const val MAX_LOW_RAM_MEMORY_BUDGET_BYTES = 64L * 1024L * 1024L
 
-    /** Back buffer retained for instant short rewinds, matching CloudStream's previous value. */
+    /** Back buffer retained for instant short rewinds. */
     const val BACK_BUFFER_MS = 30_000L
 
     /** Fallback media consumption rate when the selected format has no bitrate metadata. */
@@ -90,7 +79,7 @@ object ForwardBufferPolicy {
     /** Fallback duration of the next request when no transfer sample is available yet. */
     const val DEFAULT_REQUEST_MS = 3_000L
 
-    /** Cap on the request-startup part of the refill ETA; the body is already in throughput. */
+    /** Cap on the request-startup part of the refill ETA. */
     const val MAX_REQUEST_OVERHEAD_MS = 1_500L
 
     /** Typical gap between sequential requests when nothing has been measured yet. */
@@ -109,47 +98,33 @@ object ForwardBufferPolicy {
     const val MEMORY_PRESSURE_TARGET_FRACTION = 0.50
 
     data class Config(
-        /** Video Buffer Length in milliseconds. Zero means "Automatic". */
         val requestedBufferMs: Long,
-        /** Video Buffer Size in bytes. Zero means "Automatic". */
         val requestedRamBytes: Long,
-        /** True when ActivityManager reports a low-RAM device. */
         val lowRamDevice: Boolean,
-        /** ActivityManager.memoryClass in MiB. Zero when unknown. */
         val memoryClassMb: Int = 0,
-        /** Runtime.getRuntime().maxMemory() in bytes. Zero when unknown. */
         val maxHeapBytes: Long = 0L,
-        /** System-wide available RAM in bytes. Used only as a soft upper bound. */
         val systemAvailableBytes: Long = 0L,
     )
 
-    /**
-     * A snapshot of measured upstream performance. All values are smoothed by [NetworkMonitor];
-     * the policy never reacts to a single unusually fast or slow sample.
-     */
     data class NetworkStats(
-        /** Exponentially weighted transfer rate in bits/second, or 0 when unknown. */
         val throughputBps: Long = 0L,
-        /** Highest recent smoothed rate in bits/second, for diagnostics only. */
         val peakThroughputBps: Long = 0L,
-        /** Coefficient of variation (standard deviation / mean) of recent samples, 0..1. */
         val throughputVariation: Float = 0f,
-        /** Exponentially weighted time to first byte in milliseconds. */
         val startupLatencyMs: Long = 0L,
-        /** Exponentially weighted duration of the last completed requests, in milliseconds. */
         val lastTransferMs: Long = 0L,
-        /** Number of completed, usable samples. */
         val samples: Int = 0,
+        val state: NetworkState = NetworkState.UNKNOWN,
+        val longTermThroughputBps: Long = 0L,
+        val confidence: Float = 0f,
+        val activeRequests: Int = 0,
+        val longestStallMs: Long = 0L,
+        val isIdle: Boolean = false,
     )
 
-    /** Calculated thresholds for one player/track selection. */
     data class Plan(
         val requestedBufferMs: Long,
-        /** User target after live clamping. This is the upper target, not a bitrate-derived cap. */
         val targetMs: Long,
-        /** Baseline refill point; [decide] may raise this based on measured network conditions. */
         val refillMs: Long,
-        /** Actual allocator budget; byte pressure is enforced with hysteresis in [decide]. */
         val memoryBudgetBytes: Int,
         val lowMemoryWatermarkBytes: Int,
         val isLive: Boolean,
@@ -158,7 +133,31 @@ object ForwardBufferPolicy {
         val consumptionBps: Long,
     )
 
-    /** Why a particular loading decision was made. Used by tests and debug diagnostics. */
+    enum class BufferState {
+        INITIALIZING,
+        INITIAL_BUFFERING,
+        HEALTHY,
+        REFILLING,
+        DEGRADED_NETWORK,
+        STALLED_REQUEST,
+        NETWORK_OFFLINE,
+        LOW_MEMORY,
+        QUALITY_RECOVERY,
+        REBUFFER_RECOVERY,
+        PAUSED_PREFETCH,
+        LIVE_PLAYBACK,
+        ENDED,
+        RELEASED,
+    }
+
+    enum class DepletionRisk {
+        NONE,
+        LOW,
+        MODERATE,
+        HIGH,
+        CRITICAL,
+    }
+
     enum class Reason {
         INITIAL_LOAD,
         REBUFFER_RECOVERY,
@@ -173,32 +172,31 @@ object ForwardBufferPolicy {
         WAITING_FOR_MEMORY,
         MEMORY_PRESSURE,
         NOT_PLAYING,
+        STALLED_REQUEST,
+        NETWORK_OFFLINE,
+        QUALITY_RECOVERY,
+        PAUSED_PREFETCH,
     }
 
     data class Decision(
         val isLoading: Boolean,
         val reason: Reason,
-        /** Effective upper target after live/memory-pressure clamping. */
         val effectiveTargetMs: Long,
-        /** Dynamic refill point after throughput/volatility/speed adjustment. */
         val refillThresholdMs: Long,
-        /** Wall-clock playout runway of the current forward buffer. */
         val runwayMs: Long,
-        /** Predicted wall-clock time needed to refill to the target, 0 when unknown. */
         val timeToRefillMs: Long,
         val throughputBps: Long,
         val consumptionBps: Long,
         val dynamicRefillFraction: Float,
         val critical: Boolean,
         val memoryPressure: Boolean,
+        val bufferState: BufferState = BufferState.HEALTHY,
+        val depletionRisk: DepletionRisk = DepletionRisk.NONE,
+        val networkState: NetworkState = NetworkState.UNKNOWN,
+        val sustainableConsumptionBps: Long = 0L,
+        val isQualityRecoveryNeeded: Boolean = false,
     )
 
-    /**
-     * Builds the duration/allocator target for the current player.
-     *
-     * The bitrate is used only to estimate consumption, never to shrink the user's duration
-     * target. Memory is bounded by the allocator budget instead.
-     */
     fun createPlan(
         config: Config,
         isLive: Boolean,
@@ -243,24 +241,6 @@ object ForwardBufferPolicy {
         )
     }
 
-    /**
-     * Decides whether the loader should continue.
-     *
-     * The state machine has hysteresis: while loading it keeps going until the effective target or
-     * the byte ceiling is reached; while idle it starts again at the predictive/dynamic refill
-     * point, or immediately when the buffer is critically low or rebuffering.
-     *
-     * @param bufferedDurationUs Media3's total forward-buffered duration in media time.
-     * @param allocatedBytes total allocator bytes for this player, including the back buffer.
-     * @param playbackSpeed current playback speed; values above 1x increase wall-clock protection.
-     * @param network measured upstream performance. With no samples the policy falls back to the
-     *     adaptive baseline and Media3-safe defaults.
-     * @param playbackState Player.STATE_* mirrored by CS3IPlayer.
-     * @param playWhenReady whether playback is intended to advance.
-     * @param rebuffering Media3's LoadControl.Parameters.rebuffering flag.
-     * @param memoryPressure true while the app has received a memory-pressure callback; the
-     *     effective target is temporarily halved and the byte ceiling is enforced earlier.
-     */
     fun decide(
         plan: Plan,
         isLoading: Boolean,
@@ -268,10 +248,11 @@ object ForwardBufferPolicy {
         allocatedBytes: Long,
         playbackSpeed: Float,
         network: NetworkStats = NetworkStats(),
-        playbackState: Int = 3, // Player.STATE_READY, kept as Int so this file stays pure JVM code.
+        playbackState: Int = 3, // Player.STATE_READY
         playWhenReady: Boolean = true,
         rebuffering: Boolean = false,
         memoryPressure: Boolean = false,
+        isAdaptiveQualitySupported: Boolean = true,
     ): Decision {
         val speed = if (playbackSpeed.isFinite() && playbackSpeed > 0.1f) playbackSpeed else 1f
         val rawBufferedMs = if (bufferedDurationUs > 0L) bufferedDurationUs / 1_000L else 0L
@@ -311,8 +292,6 @@ object ForwardBufferPolicy {
 
         var fraction = BASE_REFILL_FRACTION
         if (throughput > 0L) {
-            // Downloading at barely above the media rate leaves almost no net fill rate, so start
-            // much earlier. At >= 1.5x the bitrate the baseline is safe.
             val slowLink = ((1.5 - ratio).coerceIn(0.0, 1.0) / 1.0).toFloat()
             fraction += 0.20f * slowLink
         }
@@ -329,8 +308,6 @@ object ForwardBufferPolicy {
             DEFAULT_STARTUP_MS
         }
         val requestGapMs = if (network.lastTransferMs > 0L) {
-            // Only the scheduling/connection part belongs here. The body transfer is already
-            // represented by throughput, so cap this to avoid double counting large downloads.
             network.lastTransferMs.coerceIn(0L, MAX_REQUEST_OVERHEAD_MS)
         } else {
             DEFAULT_REQUEST_GAP_MS
@@ -346,14 +323,6 @@ object ForwardBufferPolicy {
             0L
         }
 
-        // Predictive threshold. The buffer must survive the request startup and the time needed to
-        // fetch the missing media at the measured rate. With ratio = throughput / consumption and
-        // runway = B / speed, solving B / speed >= overhead + (target - B) / ratio gives:
-        //
-        //   B >= speed * (target + overhead * ratio) / (ratio + speed)
-        //
-        // If the link cannot even keep up with consumption (ratio <= speed), no threshold can make
-        // the buffer recover, so start as early as possible.
         val predictiveRefill = when {
             throughput <= 0L -> dynamicRefill
             ratio <= speed.toDouble() -> maxRefill
@@ -368,6 +337,7 @@ object ForwardBufferPolicy {
             .coerceIn(MIN_TARGET_MS, maxRefill)
         val critical = bufferedMs < CRITICAL_BUFFER_MS
         val runwayMs = (bufferedMs.toDouble() / speed.toDouble()).toLong()
+
         val effectiveBytesBudget = if (memoryPressure) {
             (plan.memoryBudgetBytes.toDouble() * 0.80).toLong()
         } else {
@@ -380,9 +350,33 @@ object ForwardBufferPolicy {
         val byteLow = effectiveBytesBudget <= 0L ||
             bytes <= (effectiveBytesBudget * BYTE_REFILL_FRACTION).toLong()
 
+        // Depletion risk evaluation
+        val risk = when {
+            critical || rebuffering -> DepletionRisk.CRITICAL
+            network.state == NetworkState.STALLED || (throughput > 0L && timeToRefillMs > runwayMs) -> DepletionRisk.HIGH
+            ratio <= (speed * 1.15) || (throughput > 0L && timeToRefillMs > (runwayMs * 0.75).toLong()) -> DepletionRisk.MODERATE
+            bufferedMs <= refillThreshold -> DepletionRisk.LOW
+            else -> DepletionRisk.NONE
+        }
+
+        // Quality recovery recommendation
+        val qualityRecoveryNeeded = isAdaptiveQualitySupported &&
+            throughput > 0L &&
+            network.samples >= MIN_THROUGHPUT_SAMPLES &&
+            network.confidence > 0.40f &&
+            ratio < (speed * 0.90) &&
+            (bufferedMs < (targetMs * 0.60) || runwayMs < 10_000L)
+
+        val sustainableBps = if (qualityRecoveryNeeded) {
+            (throughput * 0.75).toLong()
+        } else {
+            0L
+        }
+
         fun decision(
             loading: Boolean,
             reason: Reason,
+            bufferState: BufferState,
         ) = Decision(
             isLoading = loading,
             reason = reason,
@@ -395,81 +389,113 @@ object ForwardBufferPolicy {
             dynamicRefillFraction = fraction.toFloat(),
             critical = critical,
             memoryPressure = memoryPressure,
+            bufferState = bufferState,
+            depletionRisk = risk,
+            networkState = network.state,
+            sustainableConsumptionBps = sustainableBps,
+            isQualityRecoveryNeeded = qualityRecoveryNeeded,
         )
 
-        // Only ENDED means "do not load". STATE_IDLE must still be allowed: during prepare Media3
-        // can ask for the initial load before the public playback state has advanced to BUFFERING.
-        if (playbackState == 4) {
-            return decision(false, Reason.NOT_PLAYING)
+        // End of stream guard
+        if (playbackState == 4) { // Player.STATE_ENDED
+            return decision(false, Reason.NOT_PLAYING, BufferState.ENDED)
         }
 
-        // Enforce paused-playback policy when playback is not advancing (playWhenReady == false).
-        // Prefetch fills up to targetMs (and not beyond it), without aggressive predictive starvation panic.
+        // Offline link detection
+        if (network.state == NetworkState.OFFLINE && !critical) {
+            return decision(false, Reason.NETWORK_OFFLINE, BufferState.NETWORK_OFFLINE)
+        }
+
+        // Paused prefetch policy: bounded up to targetMs
         if (!playWhenReady) {
-            if (bufferedMs >= targetMs) return decision(false, Reason.TARGET_REACHED)
+            if (bufferedMs >= targetMs) {
+                return decision(false, Reason.TARGET_REACHED, BufferState.HEALTHY)
+            }
             if (bytePanic || byteHigh) {
-                return decision(false, if (isLoading) Reason.BYTE_LIMIT_REACHED else Reason.WAITING_FOR_MEMORY)
+                return decision(
+                    false,
+                    if (isLoading) Reason.BYTE_LIMIT_REACHED else Reason.WAITING_FOR_MEMORY,
+                    BufferState.LOW_MEMORY
+                )
             }
             if (critical || rebuffering) {
-                return decision(true, if (rebuffering) Reason.REBUFFER_RECOVERY else Reason.INITIAL_LOAD)
+                return decision(
+                    true,
+                    if (rebuffering) Reason.REBUFFER_RECOVERY else Reason.INITIAL_LOAD,
+                    BufferState.INITIAL_BUFFERING
+                )
             }
             if (isLoading) {
-                return decision(true, Reason.CONTINUE)
+                return decision(true, Reason.CONTINUE, BufferState.PAUSED_PREFETCH)
             }
             if (plan.isLive && bufferedMs >= plan.refillMs) {
-                return decision(false, Reason.ABOVE_REFILL)
+                return decision(false, Reason.ABOVE_REFILL, BufferState.LIVE_PLAYBACK)
             }
             if (bufferedMs <= refillThreshold) {
-                if (!byteLow) return decision(false, Reason.WAITING_FOR_MEMORY)
-                return decision(true, Reason.BELOW_REFILL)
+                if (!byteLow) return decision(false, Reason.WAITING_FOR_MEMORY, BufferState.LOW_MEMORY)
+                return decision(true, Reason.BELOW_REFILL, BufferState.PAUSED_PREFETCH)
             }
-            return decision(false, Reason.ABOVE_REFILL)
+            return decision(false, Reason.ABOVE_REFILL, BufferState.HEALTHY)
         }
 
+        // Loading in progress: keep loading until target or safety limit
         if (isLoading) {
-            if (bytePanic) return decision(false, Reason.BYTE_LIMIT_REACHED)
-            if (critical) return decision(true, Reason.CONTINUE)
-            if (byteHigh) return decision(false, Reason.BYTE_LIMIT_REACHED)
-            if (bufferedMs >= targetMs) return decision(false, Reason.TARGET_REACHED)
-            return decision(true, Reason.CONTINUE)
+            if (bytePanic) return decision(false, Reason.BYTE_LIMIT_REACHED, BufferState.LOW_MEMORY)
+            if (critical) return decision(true, Reason.CONTINUE, BufferState.REBUFFER_RECOVERY)
+            if (byteHigh) return decision(false, Reason.BYTE_LIMIT_REACHED, BufferState.LOW_MEMORY)
+            if (bufferedMs >= targetMs) return decision(false, Reason.TARGET_REACHED, BufferState.HEALTHY)
+            val currentState = when {
+                network.state == NetworkState.STALLED -> BufferState.STALLED_REQUEST
+                qualityRecoveryNeeded -> BufferState.QUALITY_RECOVERY
+                throughput > 0L && ratio < 1.1 -> BufferState.DEGRADED_NETWORK
+                plan.isLive -> BufferState.LIVE_PLAYBACK
+                else -> BufferState.REFILLING
+            }
+            return decision(true, Reason.CONTINUE, currentState)
         }
 
-        if (bytePanic) return decision(false, Reason.WAITING_FOR_MEMORY)
+        // Idle state: decide whether to start loading
+        if (bytePanic) return decision(false, Reason.WAITING_FOR_MEMORY, BufferState.LOW_MEMORY)
         if (critical) {
             return decision(
                 true,
-                if (rebuffering) Reason.REBUFFER_RECOVERY else Reason.INITIAL_LOAD
+                if (rebuffering) Reason.REBUFFER_RECOVERY else Reason.INITIAL_LOAD,
+                if (rebuffering) BufferState.REBUFFER_RECOVERY else BufferState.INITIAL_BUFFERING
             )
         }
-        if (byteHigh) return decision(false, Reason.WAITING_FOR_MEMORY)
+        if (byteHigh) return decision(false, Reason.WAITING_FOR_MEMORY, BufferState.LOW_MEMORY)
 
         if (rebuffering && bufferedMs < targetMs) {
-            return decision(true, Reason.REBUFFER_RECOVERY)
+            return decision(true, Reason.REBUFFER_RECOVERY, BufferState.REBUFFER_RECOVERY)
         }
 
         if (bufferedMs <= refillThreshold) {
-            // Byte hysteresis: once the allocator is near its budget, only restart after enough
-            // media has been consumed to fall below the low watermark. The critical-buffer path
-            // above is the exception so a depleted player can still recover.
-            if (!byteLow) return decision(false, Reason.WAITING_FOR_MEMORY)
+            if (!byteLow) return decision(false, Reason.WAITING_FOR_MEMORY, BufferState.LOW_MEMORY)
             val reason = when {
+                network.state == NetworkState.STALLED -> Reason.STALLED_REQUEST
+                qualityRecoveryNeeded -> Reason.QUALITY_RECOVERY
                 throughput > 0L && ratio <= 1.05 -> Reason.LOW_THROUGHPUT
                 predictiveRefill > dynamicRefill -> Reason.PREDICTIVE_REFILL
                 else -> Reason.BELOW_REFILL
             }
-            return decision(true, reason)
+            val state = when {
+                network.state == NetworkState.STALLED -> BufferState.STALLED_REQUEST
+                qualityRecoveryNeeded -> BufferState.QUALITY_RECOVERY
+                throughput > 0L && ratio <= 1.05 -> BufferState.DEGRADED_NETWORK
+                plan.isLive -> BufferState.LIVE_PLAYBACK
+                else -> BufferState.REFILLING
+            }
+            return decision(true, reason, state)
         }
 
-        return decision(false, if (memoryPressure) Reason.MEMORY_PRESSURE else Reason.ABOVE_REFILL)
+        val idleState = when {
+            plan.isLive -> BufferState.LIVE_PLAYBACK
+            memoryPressure -> BufferState.LOW_MEMORY
+            else -> BufferState.HEALTHY
+        }
+        return decision(false, if (memoryPressure) Reason.MEMORY_PRESSURE else Reason.ABOVE_REFILL, idleState)
     }
 
-    /**
-     * Resolves the allocator budget from device class and the user's RAM setting.
-     *
-     * ExoPlayer's allocator stores media payload in Java byte arrays, so the budget is bounded by a
-     * fraction of the app heap rather than the nominal stream bitrate. A user request for a huge
-     * buffer on a small-heap device is clamped rather than allowed to OOM the app.
-     */
     fun resolveMemoryBudget(config: Config): Int {
         val heapCeiling = when {
             config.maxHeapBytes > 0L -> (config.maxHeapBytes.toDouble() * 0.35).toLong()

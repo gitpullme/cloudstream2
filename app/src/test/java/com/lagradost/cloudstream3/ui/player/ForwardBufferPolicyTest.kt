@@ -603,4 +603,87 @@ class ForwardBufferPolicyTest {
         assertEquals(3_500L, decide(plan, loading = false, bufferedMs = 3_500L).refillThresholdMs)
         assertEquals(3_000L, decide(plan, loading = false, bufferedMs = 3_000L).runwayMs)
     }
+
+    @Test
+    fun `stalled network request sets STALLED_REQUEST state and HIGH depletion risk`() {
+        val plan = createPlan(bufferMs = 60_000L, bitrateBps = 2_000_000L)
+        val netStalled = ForwardBufferPolicy.NetworkStats(
+            throughputBps = 500_000L,
+            samples = 3,
+            state = NetworkState.STALLED,
+            longestStallMs = 4_000L,
+        )
+
+        val decision = decide(plan, loading = false, bufferedMs = 30_000L, network = netStalled)
+        assertTrue(decision.isLoading)
+        assertEquals(ForwardBufferPolicy.Reason.STALLED_REQUEST, decision.reason)
+        assertEquals(ForwardBufferPolicy.BufferState.STALLED_REQUEST, decision.bufferState)
+        assertEquals(ForwardBufferPolicy.DepletionRisk.HIGH, decision.depletionRisk)
+    }
+
+    @Test
+    fun `offline network suppresses loading unless buffer is critical`() {
+        val plan = createPlan(bufferMs = 60_000L)
+        val netOffline = ForwardBufferPolicy.NetworkStats(
+            throughputBps = 0L,
+            samples = 2,
+            state = NetworkState.OFFLINE,
+        )
+
+        // Non-critical buffer offline: do not schedule futile requests
+        val decisionNormal = decide(plan, loading = false, bufferedMs = 20_000L, network = netOffline)
+        assertFalse(decisionNormal.isLoading)
+        assertEquals(ForwardBufferPolicy.Reason.NETWORK_OFFLINE, decisionNormal.reason)
+        assertEquals(ForwardBufferPolicy.BufferState.NETWORK_OFFLINE, decisionNormal.bufferState)
+
+        // Critical buffer (< 2000ms): must attempt recovery
+        val decisionCritical = decide(plan, loading = false, bufferedMs = 1_000L, network = netOffline)
+        assertTrue(decisionCritical.isLoading)
+        assertEquals(ForwardBufferPolicy.Reason.INITIAL_LOAD, decisionCritical.reason)
+    }
+
+    @Test
+    fun `quality recovery advised when throughput is sustainably below consumption`() {
+        val plan = createPlan(bufferMs = 60_000L, bitrateBps = 5_000_000L)
+        val netLow = ForwardBufferPolicy.NetworkStats(
+            throughputBps = 2_000_000L, // 2 Mbps vs 5 Mbps consumption
+            samples = 4,
+            confidence = 0.8f,
+            state = NetworkState.DEGRADED,
+        )
+
+        val decision = decide(plan, loading = false, bufferedMs = 25_000L, network = netLow)
+        assertTrue("Must flag quality recovery needed", decision.isQualityRecoveryNeeded)
+        assertTrue("Sustainable consumption must be advised", decision.sustainableConsumptionBps in 1_000_000L..2_000_000L)
+        assertEquals(ForwardBufferPolicy.BufferState.QUALITY_RECOVERY, decision.bufferState)
+    }
+
+    @Test
+    fun `paused prefetch loads bounded to target without starvation panic`() {
+        val plan = createPlan(bufferMs = 60_000L)
+
+        // Below target: loads up to targetMs
+        val decisionLoading = decide(plan, loading = false, bufferedMs = 30_000L, playWhenReady = false)
+        assertTrue(decisionLoading.isLoading)
+        assertEquals(ForwardBufferPolicy.Reason.BELOW_REFILL, decisionLoading.reason)
+        assertEquals(ForwardBufferPolicy.BufferState.PAUSED_PREFETCH, decisionLoading.bufferState)
+
+        // Target reached: stops loading
+        val decisionFull = decide(plan, loading = false, bufferedMs = 60_000L, playWhenReady = false)
+        assertFalse(decisionFull.isLoading)
+        assertEquals(ForwardBufferPolicy.Reason.TARGET_REACHED, decisionFull.reason)
+    }
+
+    @Test
+    fun `playback speed 1x vs 1_5x vs 2x increases refill threshold`() {
+        val plan = createPlan(bufferMs = 120_000L, bitrateBps = 2_000_000L)
+        val net = network(throughputBps = 3_000_000L)
+
+        val d1x = decide(plan, loading = false, bufferedMs = 80_000L, speed = 1.0f, network = net)
+        val d15x = decide(plan, loading = false, bufferedMs = 80_000L, speed = 1.5f, network = net)
+        val d2x = decide(plan, loading = false, bufferedMs = 80_000L, speed = 2.0f, network = net)
+
+        assertTrue(d15x.refillThresholdMs >= d1x.refillThresholdMs)
+        assertTrue(d2x.refillThresholdMs >= d15x.refillThresholdMs)
+    }
 }

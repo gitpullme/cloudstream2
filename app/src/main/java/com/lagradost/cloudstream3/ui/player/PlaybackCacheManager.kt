@@ -7,33 +7,27 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheEvictor
 import androidx.media3.datasource.cache.CacheSpan
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.database.StandaloneDatabaseProvider
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 /**
- * Owns the single process-wide [SimpleCache] used for online playback.
+ * Owns the single process-wide [SimpleCache] used for online playback, with session-aware
+ * resource ownership and lock-order safety.
  *
- * CloudStream previously created a cache with `LeastRecentlyUsedCacheEvictor(0)` whenever the
- * "Video cache on disk" setting was Auto (0 MB). That evictor deletes every span immediately after
- * it is written, so the cache was effectively disabled while still paying all of the write and
- * eviction overhead. The cache directory was also registered for deletion on app exit, defeating
- * reuse across sessions.
- *
- * This manager fixes both issues and adds playback-aware eviction:
- *
- * - Auto size is derived from free disk space instead of zero.
- * - The cache persists across app exits.
- * - Recently touched spans and spans belonging to the active media source are protected from
- *   eviction as long as another eligible span exists.
- * - Spans belonging to the active playback item are protected reliably across multiple CDN domains,
- *   signed URLs, track variants and query parameters.
- * - Clearing the cache uses Media3's supported per-resource removal instead of deleting files
- *   underneath an open cache.
+ * Requirements:
+ * - One shared persistent SimpleCache across the app.
+ * - Per-session active leases and playback protection.
+ * - Never hold custom evictor lock across SimpleCache API calls.
+ * - Never evict active leases.
+ * - Reconcile spans safely on failure.
+ * - Enforce size limits immediately.
+ * - Never delete files under an open SimpleCache.
  */
 @OptIn(UnstableApi::class)
 object PlaybackCacheManager {
@@ -51,15 +45,32 @@ object PlaybackCacheManager {
     private var configuredBytes: Long = 0L
     private var configuredRequestBytes: Long = -1L
 
+    // Registered active playback sessions
+    private val sessions = ConcurrentHashMap<String, PlaybackSessionState>()
+
+    // Global / legacy active tracking for single-player fallbacks
     @Volatile
     private var activePrefix: String? = null
-
     private val activeKeys = ConcurrentHashMap.newKeySet<String>()
     private val activeUris = ConcurrentHashMap.newKeySet<String>()
     private val liveSourceUris = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
     private var bypassActiveSource = false
+
+    fun registerSession(session: PlaybackSessionState) {
+        sessions[session.sessionId] = session
+        Log.d(TAG, "registered session id=${session.sessionId} uri=${session.sourceUri}")
+    }
+
+    fun unregisterSession(sessionId: String) {
+        val removed = sessions.remove(sessionId)
+        if (removed != null) {
+            Log.d(TAG, "unregistered session id=$sessionId")
+        }
+    }
+
+    fun getSession(sessionId: String): PlaybackSessionState? = sessions[sessionId]
 
     /**
      * Returns the shared cache, creating it if necessary.
@@ -74,10 +85,7 @@ object PlaybackCacheManager {
                     val newSize = resolveDiskCacheBytes(context, requestedBytes)
                     configuredBytes = newSize
                     evictor?.setMaxBytes(newSize, existing)
-                    Log.i(
-                        TAG,
-                        "cache size setting changed to ${newSize / (1024 * 1024)}MB"
-                    )
+                    Log.i(TAG, "cache size setting changed to ${newSize / (1024 * 1024)}MB")
                 }
                 return existing
             }
@@ -127,7 +135,7 @@ object PlaybackCacheManager {
         }
     }
 
-    /** Called when a new online media item becomes the active playback source. */
+    /** Called when a new online media item becomes the active playback source (legacy support). */
     fun setActiveSource(sourceUri: String?, directoryScope: Boolean) {
         val prefix = sourceUri?.let { keyPrefix(it, directoryScope) }
         activePrefix = prefix
@@ -154,7 +162,7 @@ object PlaybackCacheManager {
         evictor?.clearActiveOwnership()
     }
 
-    /** Registers a specific cache key or segment URI as owned by the active playback session. */
+    /** Registers a specific cache key or segment URI as owned by active playback. */
     fun registerActiveKey(key: String, uri: Uri? = null) {
         activeKeys.add(key)
         uri?.let {
@@ -164,8 +172,15 @@ object PlaybackCacheManager {
         evictor?.registerActiveKey(key)
     }
 
-    fun isSpanActive(key: String): Boolean =
-        evictor?.isSpanActive(key) ?: defaultIsSpanActive(key)
+    fun isSpanActive(key: String): Boolean {
+        val now = System.currentTimeMillis()
+        for (session in sessions.values) {
+            if (session.isResourceActive(key, now)) {
+                return true
+            }
+        }
+        return evictor?.isSpanActive(key) ?: defaultIsSpanActive(key)
+    }
 
     private fun defaultIsSpanActive(key: String): Boolean {
         if (activeKeys.contains(key)) return true
@@ -177,10 +192,6 @@ object PlaybackCacheManager {
         return activeUris.contains(norm)
     }
 
-    /**
-     * Live streams must not be served from a stale disk cache and their segment URLs are often
-     * reused. Once a source is known to be live, all of its media requests bypass the disk cache.
-     */
     fun setSourceLive(isLive: Boolean) {
         bypassActiveSource = isLive
         Log.d(TAG, "cache live bypass=$isLive")
@@ -199,14 +210,17 @@ object PlaybackCacheManager {
 
     fun isSourceLive(sourceUri: String?): Boolean {
         if (sourceUri == null) return false
-        return liveSourceUris.contains(normalizeUri(sourceUri))
+        val norm = normalizeUri(sourceUri)
+        for (session in sessions.values) {
+            if (session.isLive && session.normalizedSourceUri == norm) {
+                return true
+            }
+        }
+        return liveSourceUris.contains(norm)
     }
 
-    /**
-     * Returns true for resources that must never be cached: HLS/DASH manifests (a cached live
-     * playlist would freeze the live edge) and every request of a source already known to be live.
-     */
-    fun shouldBypassCache(uri: Uri): Boolean {
+    fun shouldBypassCache(uri: Uri, session: PlaybackSessionState? = null): Boolean {
+        if (session != null && session.isLive) return true
         if (bypassActiveSource) return true
         if (isSourceLive(uri.toString())) return true
         return isManifest(uri)
@@ -229,25 +243,28 @@ object PlaybackCacheManager {
 
     /**
      * Removes cached resources through Media3's cache API. Returns the number of bytes freed.
-     *
-     * Spans belonging to the currently playing title are skipped, so clearing the cache while
-     * audio-only or picture-in-picture playback is active cannot remove data under the player.
-     * This is intentionally not a recursive file delete.
+     * Spans belonging to any currently playing session are skipped.
      */
     fun clearAll(): Long {
         synchronized(lock) {
             val current = cache ?: return 0L
             val before = runCatching { current.cacheSpace }.getOrDefault(0L)
+            var freed = 0L
             runCatching {
                 current.keys.toList().forEach { key ->
                     if (isSpanActive(key)) {
                         return@forEach
                     }
-                    runCatching { current.removeResource(key) }
+                    val spans = current.getCachedSpans(key)
+                    val keyBytes = spans.sumOf { it.length }
+                    runCatching {
+                        current.removeResource(key)
+                        freed += keyBytes
+                    }
                 }
             }.onFailure { Log.w(TAG, "failed to clear cache", it) }
             val after = runCatching { current.cacheSpace }.getOrDefault(0L)
-            return (before - after).coerceAtLeast(0L)
+            return max(freed, (before - after).coerceAtLeast(0L))
         }
     }
 
@@ -270,7 +287,6 @@ object PlaybackCacheManager {
         val writtenBytes: Long,
     )
 
-    /** Resolves the user setting or a free-space-derived Automatic size. */
     fun resolveDiskCacheBytes(context: Context, requestedBytes: Long): Long {
         if (requestedBytes > 0L) {
             return requestedBytes.coerceIn(MIN_CACHE_BYTES, MAX_CACHE_BYTES)
@@ -282,12 +298,6 @@ object PlaybackCacheManager {
         return (free / 8L).coerceIn(MIN_AUTO_CACHE_BYTES, MAX_AUTO_CACHE_BYTES)
     }
 
-    /**
-     * Computes the cache-key prefix protected for the active source.
-     *
-     * For HLS/DASH the playlist URL is not a prefix of segment URLs, so the containing directory is
-     * protected. For progressive files the exact URL prefix is enough.
-     */
     fun keyPrefix(sourceUri: String, directoryScope: Boolean): String {
         if (!directoryScope) return sourceUri
         return runCatching {
@@ -304,7 +314,6 @@ object PlaybackCacheManager {
         }.getOrDefault(sourceUri)
     }
 
-    /** Normalizes a URI string by stripping query parameters and hash fragments. */
     fun normalizeUri(uriString: String): String = runCatching {
         val uri = Uri.parse(uriString)
         buildString {
@@ -315,11 +324,11 @@ object PlaybackCacheManager {
     }.getOrDefault(uriString.substringBefore('?').substringBefore('#'))
 
     /**
-     * LRU evictor that protects recently read spans and the active media source.
+     * LRU evictor with lock-order safety.
      *
-     * Media3's stock LRU evictor is a strictly byte-bounded TreeSet. This implementation keeps the
-     * same bound but prefers to evict older, unrelated content first. If only protected spans
-     * remain, it degrades to ordinary LRU rather than letting the cache grow without limit.
+     * CRITICAL RULE: Never hold the custom evictor lock while calling SimpleCache APIs.
+     * Candidate spans are selected and marked pending removal under the lock, then removed
+     * outside the lock.
      */
     @OptIn(UnstableApi::class)
     class PlaybackAwareCacheEvictor(
@@ -328,6 +337,7 @@ object PlaybackCacheManager {
     ) : CacheEvictor {
         private val lock = Any()
         private val lru = LinkedHashSet<CacheSpan>()
+        private val pendingRemoval = mutableSetOf<CacheSpan>()
         private var currentSize = 0L
         private var initialized = false
         @Volatile
@@ -416,6 +426,7 @@ object PlaybackCacheManager {
             attachedCache = cache
             synchronized(lock) {
                 removeLocked(span)
+                pendingRemoval.remove(span)
             }
         }
 
@@ -441,19 +452,27 @@ object PlaybackCacheManager {
             }
         }
 
+        /**
+         * Evicts spans until cache size is at or below maxBytes.
+         * SimpleCache.removeSpan is strictly invoked OUTSIDE the evictor lock.
+         */
         fun evict(cache: Cache) {
             attachedCache = cache
             val failedVictims = mutableSetOf<CacheSpan>()
             var evictions = 0
+
             while (evictions < MAX_EVICTIONS_PER_CALL) {
+                // 1. Under lock: select candidate, mark pending removal, update accounting
                 val victim: CacheSpan? = synchronized(lock) {
                     if (currentSize <= maxBytes) return
                     selectVictimLocked(failedVictims)?.also {
+                        pendingRemoval.add(it)
                         removeLocked(it)
                     }
                 }
                 if (victim == null) break
 
+                // 2. Outside lock: execute SimpleCache removal
                 val success = try {
                     cache.removeSpan(victim)
                     true
@@ -462,55 +481,74 @@ object PlaybackCacheManager {
                     false
                 }
 
-                if (!success) {
+                // 3. Under lock: confirm removal or rollback
+                if (success) {
                     synchronized(lock) {
+                        pendingRemoval.remove(victim)
+                    }
+                } else {
+                    synchronized(lock) {
+                        pendingRemoval.remove(victim)
                         addLocked(victim)
                         failedVictims.add(victim)
-                        reconcileLocked(cache)
                     }
+                    // 4. Reconcile outside lock
+                    reconcile(cache)
                 }
                 evictions++
             }
+
             if (usageBytes() > maxBytes) {
-                Log.w(
+                Log.d(
                     TAG,
-                    "cache still above target after $evictions evictions: " +
-                        "${usageBytes()} > $maxBytes (protected spans or failed removals)"
+                    "cache usage (${usageBytes() / 1024}KB) exceeds max (${maxBytes / 1024}KB) " +
+                        "because remaining spans are protected by active playback or leases."
                 )
             }
         }
 
         private fun selectVictimLocked(excluded: Set<CacheSpan>): CacheSpan? {
             val now = System.currentTimeMillis()
-            return lru.firstOrNull { it !in excluded && !isSpanActive(it.key) && !isRecent(it, now) }
-                ?: lru.firstOrNull { it !in excluded && !isSpanActive(it.key) }
-                ?: lru.firstOrNull { it !in excluded && !isRecent(it, now) }
-                ?: lru.firstOrNull { it !in excluded }
+            // Active leases and active sessions have absolute protection
+            val isProtected: (CacheSpan) -> Boolean = { span ->
+                span in excluded || span in pendingRemoval || PlaybackCacheManager.isSpanActive(span.key)
+            }
+
+            // 1. Oldest non-protected and non-recent
+            val candidate1 = lru.firstOrNull { !isProtected(it) && !isRecent(it, now) }
+            if (candidate1 != null) return candidate1
+
+            // 2. Oldest non-protected (even if recent)
+            val candidate2 = lru.firstOrNull { !isProtected(it) }
+            if (candidate2 != null) return candidate2
+
+            // Active spans are never evicted!
+            return null
         }
 
-        private fun reconcileLocked(cache: Cache) {
+        private fun reconcile(cache: Cache) {
+            val actualSpans = mutableListOf<CacheSpan>()
+            var cacheSpace = 0L
             try {
                 val keys = cache.keys
                 if (keys.isNotEmpty()) {
-                    val actualSpans = mutableListOf<CacheSpan>()
                     for (k in keys) {
                         actualSpans.addAll(cache.getCachedSpans(k))
                     }
-                    if (actualSpans.isNotEmpty()) {
-                        lru.clear()
-                        lru.addAll(actualSpans.sortedBy { it.lastTouchTimestamp })
-                        currentSize = actualSpans.sumOf { it.length }
-                        return
-                    }
                 }
-                val space = runCatching { cache.cacheSpace }.getOrDefault(0L)
-                if (space > 0L) {
-                    currentSize = space
-                } else {
-                    currentSize = lru.sumOf { it.length }
+                cacheSpace = cache.cacheSpace
+            } catch (t: Throwable) {
+                Log.w(TAG, "failed to inspect cache spans during reconciliation", t)
+            }
+
+            synchronized(lock) {
+                if (actualSpans.isNotEmpty()) {
+                    lru.clear()
+                    lru.addAll(actualSpans.sortedBy { it.lastTouchTimestamp })
+                    currentSize = actualSpans.sumOf { it.length }
+                } else if (cacheSpace > 0L) {
+                    currentSize = cacheSpace
                 }
-            } catch (_: Throwable) {
-                currentSize = lru.sumOf { it.length }
             }
         }
 
