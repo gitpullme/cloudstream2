@@ -154,6 +154,7 @@ class CS3IPlayer : IPlayer {
     var videoBufferMs = 0L
     var prefetchModeEnabled = false
     var prefetchLimitMb = 1024
+    var onPrefetchCoverageChanged: ((Long) -> Unit)? = null
 
     val imageGenerator = IPreviewGenerator.new()
 
@@ -1369,7 +1370,11 @@ class CS3IPlayer : IPlayer {
                         upstreamFactory = upstream,
                         defaultHeaders = onlineSource.headers,
                         cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
-                    )
+                    ).apply {
+                        onPrefetchCoverageChanged = { posMs ->
+                            this@CS3IPlayer.onPrefetchCoverageChanged?.invoke(posMs)
+                        }
+                    }
                     session.prefetchCoordinator = coordinator
                 }
 
@@ -1377,6 +1382,7 @@ class CS3IPlayer : IPlayer {
                     cacheFactory = cacheFactory,
                     upstreamFactory = upstream,
                     session = session,
+                    cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
                     shouldBypass = { uri ->
                         (loadControl?.isLiveStream() == true) || PlaybackCacheManager.shouldBypassCache(uri, session)
                     },

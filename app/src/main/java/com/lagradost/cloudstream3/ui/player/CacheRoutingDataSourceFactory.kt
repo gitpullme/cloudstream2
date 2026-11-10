@@ -29,6 +29,7 @@ class CacheRoutingDataSourceFactory(
     private val cacheFactory: DataSource.Factory,
     private val upstreamFactory: DataSource.Factory,
     private val session: PlaybackSessionState? = null,
+    private val cacheKeyFactory: (DataSpec) -> String = { it.key ?: it.uri.toString() },
     private val shouldBypass: (Uri) -> Boolean = { uri -> PlaybackCacheManager.shouldBypassCache(uri, session) },
 ) : DataSource.Factory {
 
@@ -36,6 +37,7 @@ class CacheRoutingDataSourceFactory(
         cacheFactory = cacheFactory,
         upstreamFactory = upstreamFactory,
         session = session,
+        cacheKeyFactory = cacheKeyFactory,
         shouldBypass = shouldBypass,
     )
 
@@ -43,6 +45,7 @@ class CacheRoutingDataSourceFactory(
         private val cacheFactory: DataSource.Factory,
         private val upstreamFactory: DataSource.Factory,
         private val session: PlaybackSessionState?,
+        private val cacheKeyFactory: (DataSpec) -> String,
         private val shouldBypass: (Uri) -> Boolean,
     ) : DataSource {
         private val listeners = mutableListOf<TransferListener>()
@@ -61,7 +64,7 @@ class CacheRoutingDataSourceFactory(
             // Ensure any previous delegate and lease are closed cleanly before repeated open
             closeInternal()
 
-            val cacheKey = dataSpec.key ?: dataSpec.uri.toString()
+            val cacheKey = dataSpec.key ?: cacheKeyFactory(dataSpec)
 
             val prefetchCoordinator = session?.prefetchCoordinator
             if (prefetchCoordinator != null) {

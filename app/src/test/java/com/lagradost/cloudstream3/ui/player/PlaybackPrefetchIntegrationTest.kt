@@ -248,4 +248,127 @@ class PlaybackPrefetchIntegrationTest {
         session2.release()
         scheduler2.release()
     }
+
+    @Test
+    fun `production path integration test - PlaybackPrefetchCoordinator schedules upcoming HLS segment through scheduler and Media3 reuses cache`() = runBlocking {
+        val m3u8 = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:6
+            #EXTINF:6.0,
+            https://cdn.example.com/hls/segment_001.ts
+            #EXT-X-ENDLIST
+        """.trimIndent()
+        val playlist = androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser().parse(
+            segmentUri,
+            m3u8.byteInputStream(Charsets.UTF_8)
+        )
+
+        val upstream = CountingUpstreamDataSource(segmentData)
+        val upstreamFactory = DataSource.Factory { upstream }
+        val defaultHeaders = mapOf("User-Agent" to "CloudStreamPlayer")
+        val keyFactory = HeaderAwareCacheKeyFactory(defaultHeaders)
+
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory(keyFactory)
+            setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        }
+
+        val session = PlaybackSessionState(sourceUri = segmentUri.toString(), prefetchModeEnabled = true)
+        val fakePlayer = object : androidx.media3.common.Player by (java.lang.reflect.Proxy.newProxyInstance(
+            androidx.media3.common.Player::class.java.classLoader,
+            arrayOf(androidx.media3.common.Player::class.java)
+        ) { _, method, _ ->
+            when (method.name) {
+                "getApplicationLooper" -> android.os.Looper.getMainLooper()
+                "getCurrentPosition" -> 0L
+                "getBufferedPosition" -> 0L
+                "getDuration" -> 6000L
+                "getPlaybackState" -> androidx.media3.common.Player.STATE_READY
+                "isPlaying" -> true
+                "getPlayWhenReady" -> true
+                "getCurrentManifest" -> playlist
+                "getCurrentTracks" -> null
+                "getPlaybackParameters" -> androidx.media3.common.PlaybackParameters.DEFAULT
+                else -> null
+            }
+        } as androidx.media3.common.Player) {}
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { fakePlayer },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            defaultHeaders = defaultHeaders,
+            cacheKeyFactory = { keyFactory.buildCacheKey(it) },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // Schedule upcoming segments via real coordinator
+        val snapshot = PlaybackPlayerSnapshot.capture(
+            playerProvider = { fakePlayer },
+            sourceUri = segmentUri,
+            selectedMime = androidx.media3.common.MimeTypes.APPLICATION_M3U8,
+            isLive = false,
+        )
+        assertNotNull(snapshot)
+
+        val adapter = HlsPrefetchAdapter(
+            defaultHeaders = defaultHeaders,
+            cacheKeyFactory = { keyFactory.buildCacheKey(it) },
+        )
+        val requests = adapter.getUpcomingRequests(snapshot!!, 100L * 1024L * 1024L)
+        assertEquals(1, requests.size)
+
+        // Enqueue through the production scheduler
+        val enqueued = coordinator.scheduler.enqueue(requests.first())
+
+        // Wait for prefetch worker to complete the segment
+        var waitedMs = 0
+        while (enqueued.status != PrefetchRequest.Status.COMPLETED && waitedMs < 2000) {
+            kotlinx.coroutines.delay(50)
+            waitedMs += 50
+        }
+        assertEquals("Worker must complete prefetch request", PrefetchRequest.Status.COMPLETED, enqueued.status)
+        assertEquals("Upstream must be accessed exactly once by prefetch", 1, upstream.openCount.get())
+
+        // Verify SimpleCache has the chunk
+        val cacheKey = keyFactory.buildCacheKey(requests.first().dataSpec)
+        assertTrue(simpleCache.isCached(cacheKey, 0L, segmentData.size.toLong()))
+
+        // Media3 requests the same segment via CacheRoutingDataSourceFactory
+        val routingFactory = CacheRoutingDataSourceFactory(
+            cacheFactory = cacheDataSourceFactory,
+            upstreamFactory = upstreamFactory,
+            session = session,
+            cacheKeyFactory = { keyFactory.buildCacheKey(it) },
+        )
+        val media3DataSource = routingFactory.createDataSource()
+        val opened = media3DataSource.open(requests.first().dataSpec)
+        assertEquals(segmentData.size.toLong(), opened)
+
+        val readBuf = ByteArray(segmentData.size)
+        var totalRead = 0
+        while (totalRead < segmentData.size) {
+            val r = media3DataSource.read(readBuf, totalRead, segmentData.size - totalRead)
+            if (r < 0) break
+            totalRead += r
+        }
+        media3DataSource.close()
+
+        assertEquals(segmentData.size, totalRead)
+        org.junit.Assert.assertArrayEquals(segmentData, readBuf)
+
+        // CRITICAL CHECK: Media3 read from SimpleCache, upstream openCount remains 1!
+        assertEquals("Playback must reuse cache with no second upstream request", 1, upstream.openCount.get())
+
+        // Clean release
+        coordinator.release()
+        session.release()
+        assertEquals(0, coordinator.scheduler.getActiveWorkerCount())
+        assertTrue("All leases must be released on session release", session.getActiveLeasedKeys().isEmpty())
+    }
 }

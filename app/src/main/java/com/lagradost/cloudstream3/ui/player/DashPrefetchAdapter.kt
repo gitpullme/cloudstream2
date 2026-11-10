@@ -7,73 +7,89 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.exoplayer.dash.DashSegmentIndex
+import androidx.media3.exoplayer.dash.manifest.AdaptationSet
 import androidx.media3.exoplayer.dash.manifest.DashManifest
+import androidx.media3.exoplayer.dash.manifest.Representation
 
+/**
+ * DASH segment prefetch adapter respecting active track selection and storage budget.
+ */
 @OptIn(UnstableApi::class)
 class DashPrefetchAdapter(
-    val manifestProvider: () -> Any?,
     val defaultHeaders: Map<String, String> = emptyMap(),
     val cacheKeyFactory: (DataSpec) -> String,
 ) : PrefetchAdapter {
 
+    override val name: String = "DASH"
+
     companion object {
-        private const val NEAR_PLAYHEAD_US = 10_000_000L
-        private const val FORWARD_RUNWAY_US = 30_000_000L
+        private const val NEAR_PLAYHEAD_US = 15_000_000L
+        private const val FORWARD_RUNWAY_US = 60_000_000L
     }
 
-    override suspend fun isSupported(sourceUri: Uri, mimeType: String?): Boolean {
+    override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
+        if (manifest is DashManifest) return true
         if (mimeType == MimeTypes.APPLICATION_MPD) return true
         val path = sourceUri.path?.lowercase() ?: return false
         return path.endsWith(".mpd") || path.contains(".mpd")
     }
 
     override suspend fun getUpcomingRequests(
-        currentPositionUs: Long,
-        bufferedPositionUs: Long,
-        durationUs: Long,
-        forwardWindowUs: Long,
+        snapshot: PlaybackPlayerSnapshot,
+        availableBudgetBytes: Long,
     ): List<PrefetchRequest> {
-        val manifest = manifestProvider() as? DashManifest ?: return emptyList()
-        val isDynamic = manifest.dynamic
-        val effectiveWindowUs = if (isDynamic) minOf(forwardWindowUs, 15_000_000L) else forwardWindowUs
-        val maxTargetTimeUs = currentPositionUs + effectiveWindowUs
+        val manifest = snapshot.currentManifest as? DashManifest ?: return emptyList()
+        if (availableBudgetBytes <= 0L) return emptyList()
 
+        val isDynamic = manifest.dynamic
+        val prefetchStartUs = maxOf(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
         val requests = mutableListOf<PrefetchRequest>()
+        var scheduledBytes = 0L
+
+        // Find active video and audio format IDs from snapshot track selection
+        val selectedFormatIds = snapshot.currentTracks?.groups?.asSequence()
+            ?.flatMap { g -> (0 until g.length).filter { g.isTrackSelected(it) }.map { g.getTrackFormat(it).id } }
+            ?.filterNotNull()
+            ?.toSet() ?: emptySet()
 
         for (periodIndex in 0 until manifest.periodCount) {
             val period = manifest.getPeriod(periodIndex)
             val periodDurationUs = manifest.getPeriodDurationUs(periodIndex)
 
             for (adaptationSet in period.adaptationSets) {
-                // Prefetch both audio and video representations
                 val isVideo = adaptationSet.type == C.TRACK_TYPE_VIDEO
                 val isAudio = adaptationSet.type == C.TRACK_TYPE_AUDIO
                 if (!isVideo && !isAudio) continue
 
-                // Pick primary representation
-                val representation = adaptationSet.representations.firstOrNull() ?: continue
+                // Select representation matching currently selected track format ID if available
+                val representation = resolveActiveRepresentation(adaptationSet, selectedFormatIds) ?: continue
                 val baseUri = representation.baseUrls.firstOrNull()?.url ?: ""
 
                 // 1. Initialization Segment
                 representation.initializationUri?.let { initRangedUri ->
                     val initUri = initRangedUri.resolveUri(baseUri)
+                    val initLength = if (initRangedUri.length > 0) initRangedUri.length else C.LENGTH_UNSET.toLong()
                     val initSpec = DataSpec.Builder()
                         .setUri(initUri)
                         .setPosition(initRangedUri.start)
-                        .setLength(if (initRangedUri.length > 0) initRangedUri.length else C.LENGTH_UNSET.toLong())
+                        .setLength(initLength)
                         .setHttpRequestHeaders(defaultHeaders)
                         .build()
 
-                    val identity = PrefetchRequestIdentity.fromDataSpec(initSpec, cacheKeyFactory, defaultHeaders)
-                    requests += PrefetchRequest(
-                        identity = identity,
-                        priority = PrefetchRequest.Priority.IMMEDIATE,
-                        mediaTimeUs = 0L,
-                        durationUs = 0L,
-                        isInit = true,
-                        trackType = adaptationSet.type,
-                        dataSpec = initSpec,
-                    )
+                    val initBytes = if (initLength > 0) initLength else 128 * 1024L
+                    if (scheduledBytes + initBytes <= availableBudgetBytes) {
+                        scheduledBytes += initBytes
+                        val identity = PrefetchRequestIdentity.fromDataSpec(initSpec, cacheKeyFactory, defaultHeaders)
+                        requests += PrefetchRequest(
+                            identity = identity,
+                            priority = PrefetchRequest.Priority.IMMEDIATE,
+                            mediaTimeUs = 0L,
+                            durationUs = 0L,
+                            isInit = true,
+                            trackType = adaptationSet.type,
+                            dataSpec = initSpec,
+                        )
+                    }
                 }
 
                 // 2. Media Segments
@@ -81,26 +97,46 @@ class DashPrefetchAdapter(
                 if (index != null) {
                     val firstSegmentNum = index.firstSegmentNum
                     val segmentCount = index.getSegmentCount(periodDurationUs)
+                    var liveSegmentsScheduled = 0
+
                     if (segmentCount != DashSegmentIndex.INDEX_UNBOUNDED.toLong() && segmentCount > 0) {
                         for (segNum in firstSegmentNum until (firstSegmentNum + segmentCount)) {
                             val timeUs = index.getTimeUs(segNum)
                             val duration = index.getDurationUs(segNum, periodDurationUs)
                             val endTimeUs = timeUs + duration
 
-                            if (endTimeUs > currentPositionUs && timeUs <= maxTargetTimeUs) {
+                            // Bound live streams
+                            if (isDynamic && timeUs > snapshot.currentPositionUs) {
+                                if (liveSegmentsScheduled >= 3) break
+                            }
+
+                            if (endTimeUs > prefetchStartUs) {
                                 val rangedUri = index.getSegmentUrl(segNum)
                                 val segUri = rangedUri.resolveUri(baseUri)
+                                val segLength = if (rangedUri.length > 0) rangedUri.length else C.LENGTH_UNSET.toLong()
                                 val spec = DataSpec.Builder()
                                     .setUri(segUri)
                                     .setPosition(rangedUri.start)
-                                    .setLength(if (rangedUri.length > 0) rangedUri.length else C.LENGTH_UNSET.toLong())
+                                    .setLength(segLength)
                                     .setHttpRequestHeaders(defaultHeaders)
                                     .build()
 
+                                val estBytes = if (segLength > 0) {
+                                    segLength
+                                } else {
+                                    val bitrate = representation.format.bitrate.takeIf { it > 0 } ?: 2_000_000
+                                    (duration * bitrate) / 8_000_000L
+                                }
+
+                                if (scheduledBytes + estBytes > availableBudgetBytes) {
+                                    break
+                                }
+                                scheduledBytes += estBytes
+
                                 val identity = PrefetchRequestIdentity.fromDataSpec(spec, cacheKeyFactory, defaultHeaders)
                                 val priority = when {
-                                    timeUs <= currentPositionUs + NEAR_PLAYHEAD_US -> PrefetchRequest.Priority.NEXT_MEDIA
-                                    timeUs <= currentPositionUs + FORWARD_RUNWAY_US -> PrefetchRequest.Priority.FORWARD_MEDIA
+                                    timeUs <= prefetchStartUs + NEAR_PLAYHEAD_US -> PrefetchRequest.Priority.NEXT_MEDIA
+                                    timeUs <= prefetchStartUs + FORWARD_RUNWAY_US -> PrefetchRequest.Priority.FORWARD_MEDIA
                                     else -> PrefetchRequest.Priority.USEFUL_PREFETCH
                                 }
 
@@ -113,6 +149,10 @@ class DashPrefetchAdapter(
                                     trackType = adaptationSet.type,
                                     dataSpec = spec,
                                 )
+
+                                if (isDynamic) {
+                                    liveSegmentsScheduled++
+                                }
                             }
                         }
                     }
@@ -121,5 +161,16 @@ class DashPrefetchAdapter(
         }
 
         return requests
+    }
+
+    private fun resolveActiveRepresentation(
+        adaptationSet: AdaptationSet,
+        selectedFormatIds: Set<String>,
+    ): Representation? {
+        if (selectedFormatIds.isNotEmpty()) {
+            val matched = adaptationSet.representations.firstOrNull { it.format.id in selectedFormatIds }
+            if (matched != null) return matched
+        }
+        return adaptationSet.representations.firstOrNull()
     }
 }

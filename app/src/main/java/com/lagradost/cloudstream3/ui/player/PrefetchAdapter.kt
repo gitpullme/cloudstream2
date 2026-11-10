@@ -1,27 +1,34 @@
 package com.lagradost.cloudstream3.ui.player
 
 import android.net.Uri
-import androidx.annotation.OptIn
-import androidx.media3.common.util.UnstableApi
 
-@OptIn(UnstableApi::class)
+/**
+ * Strategy interface for media format-specific prefetching (HLS, DASH, Progressive MP4).
+ */
 interface PrefetchAdapter {
-    /**
-     * Determines whether this adapter can handle the given media source.
-     */
-    suspend fun isSupported(sourceUri: Uri, mimeType: String?): Boolean
+    val name: String
 
     /**
-     * Returns ordered upcoming prefetch requests for the given playback window.
+     * Checks if this adapter can handle the given media source.
+     */
+    suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any? = null): Boolean
+
+    /**
+     * Inspects the thread-safe player snapshot and returns upcoming chunks to prefetch
+     * within the available storage budget.
      */
     suspend fun getUpcomingRequests(
-        currentPositionUs: Long,
-        bufferedPositionUs: Long,
-        durationUs: Long,
-        forwardWindowUs: Long,
+        snapshot: PlaybackPlayerSnapshot,
+        availableBudgetBytes: Long,
     ): List<PrefetchRequest>
 
-    fun onSeek(newPositionUs: Long) {}
+    /**
+     * Called when the user initiates a playback seek.
+     */
+    fun onSeek(newPositionUs: Long) = Unit
 
-    fun release() {}
+    /**
+     * Releases any adapter-scoped resources.
+     */
+    fun release() = Unit
 }

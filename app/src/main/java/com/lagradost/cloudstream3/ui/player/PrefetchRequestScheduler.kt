@@ -6,7 +6,6 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.SimpleCache
@@ -15,14 +14,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.util.PriorityQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -34,14 +34,13 @@ import kotlin.math.min
  * Inspired by FastStream's DownloadManager.
  *
  * Requirements:
- * - One deduplicated request registry per playback session.
- * - URL/range/headers deduplication. Multiple consumers watching same request.
- * - Bounded priority queue (IMMEDIATE, NEXT_MEDIA, FORWARD_MEDIA, USEFUL_PREFETCH, BACKWARD_SEEK, SPECULATIVE).
- * - Bounded parallel download workers: start with 1-2 workers, max 4 workers on Android.
- * - Adaptive worker count: increase on measured throughput improvement, reduce on 429/503/timeout.
- * - Respect cache capacity and disk storage safety reserve (never fill device disk).
- * - Cancellation on seek and session release.
- * - Single-writer coordination: prevent races between prefetch and Media3.
+ * - Thread-safe synchronization on a single lock object.
+ * - URL/range/headers deduplication with exact cache-key matching.
+ * - Strict storage-budget enforcement: background prefetch never bypasses the limit.
+ * - Worker reservation tracking to prevent collective oversubscription.
+ * - Bounded parallel workers (1 to 4 max on Android).
+ * - Single-writer coordination: prefetch cancels and cleanly yields before Media3 writes.
+ * - Complete lifecycle cancellation on release.
  */
 @OptIn(UnstableApi::class)
 class PrefetchRequestScheduler(
@@ -56,33 +55,39 @@ class PrefetchRequestScheduler(
         const val INITIAL_WORKERS = 1
         const val MAX_WORKERS = 4
         const val MIN_WORKERS = 1
-        const val MIN_DISK_RESERVE_BYTES = 50L * 1024L * 1024L // 50 MB reserve
-        const val BUFFER_SIZE = 32 * 1024 // 32 KB streaming chunk
+        const val MIN_DISK_RESERVE_BYTES = 50L * 1024L * 1024L // 50 MB safety margin
+        const val BUFFER_SIZE = 32 * 1024 // 32 KB chunk
         const val MAX_RETRIES = 2
         const val BACKOFF_DELAY_MS = 1500L
+        const val HANDOFF_TIMEOUT_MS = 100L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val queueMutex = Mutex()
+    private val lock = Any()
     private val priorityQueue = PriorityQueue<PrefetchRequest>()
 
-    // Registry of all known requests (queued, running, completed, etc.)
+    // Registry of all active requests
     val registry = ConcurrentHashMap<PrefetchRequestIdentity, PrefetchRequest>()
 
     // Active workers
     private val activeWriters = ConcurrentHashMap<String, CacheWriter>()
+    private val activeWorkerLatches = ConcurrentHashMap<String, CountDownLatch>()
     private val activeWorkerJobs = ConcurrentHashMap<Int, Job>()
 
-    // In-flight media3 upstream downloads (to prevent prefetch from racing with Media3)
+    // In-flight media3 upstream downloads
     val media3ActiveRequests = ConcurrentHashMap.newKeySet<PrefetchRequestIdentity>()
+
+    // Storage reservations (bytes actively claimed by running workers)
+    val reservedBytes = AtomicLong(0L)
 
     // Concurrency state
     private val targetWorkers = AtomicInteger(INITIAL_WORKERS)
     private val activeWorkerCount = AtomicInteger(0)
     private val isPaused = AtomicBoolean(false)
+    private val isReleased = AtomicBoolean(false)
     private val lastBackoffTimeMs = AtomicLong(0L)
 
-    // Throughput tracking for concurrency adaptation
+    // Throughput tracking for adaptive scaling
     private var lastMeasuredThroughputBps = 0L
     private var consecutiveSuccesses = 0
 
@@ -101,23 +106,26 @@ class PrefetchRequestScheduler(
 
     fun getActiveWorkerCount(): Int = activeWorkerCount.get()
 
-    fun getQueueDepth(): Int = synchronized(priorityQueue) { priorityQueue.size }
+    fun getQueueDepth(): Int = synchronized(lock) { priorityQueue.size }
 
     /**
      * Enqueues or deduplicates a prefetch request.
-     * If an identical request is already registered, attaches as watcher and promotes priority if higher.
      */
-    suspend fun enqueue(request: PrefetchRequest): PrefetchRequest {
-        val identity = request.identity
-
-        // If Media3 is currently loading this exact resource upstream, skip speculative prefetch
-        if (media3ActiveRequests.contains(identity)) {
-            Log.d(TAG, "media3 is already loading ${identity.cacheKey}, skipping prefetch")
+    fun enqueue(request: PrefetchRequest): PrefetchRequest {
+        if (isReleased.get()) {
             request.status = PrefetchRequest.Status.CANCELLED
             return request
         }
 
-        // Check if resource is already completely cached in SimpleCache
+        val identity = request.identity
+
+        // If Media3 is currently loading this exact chunk, skip speculative prefetch
+        if (media3ActiveRequests.contains(identity)) {
+            request.status = PrefetchRequest.Status.CANCELLED
+            return request
+        }
+
+        // Check if resource is already in SimpleCache
         val cache = getCache()
         if (cache != null) {
             val length = if (identity.length > 0) identity.length else 1L
@@ -128,15 +136,13 @@ class PrefetchRequestScheduler(
             }
         }
 
-        queueMutex.withLock {
+        synchronized(lock) {
             val existing = registry[identity]
             if (existing != null && !existing.isTerminal()) {
-                // Deduplicate and promote priority if new request has higher priority
                 duplicateReuseCount.incrementAndGet()
                 existing.watchers++
                 if (request.priority.rank < existing.priority.rank) {
                     existing.priority = request.priority
-                    // Re-sort priority queue if still queued
                     if (existing.status == PrefetchRequest.Status.QUEUED) {
                         priorityQueue.remove(existing)
                         priorityQueue.offer(existing)
@@ -145,7 +151,6 @@ class PrefetchRequestScheduler(
                 return existing
             }
 
-            // Fresh request
             request.status = PrefetchRequest.Status.QUEUED
             registry[identity] = request
             priorityQueue.offer(request)
@@ -157,26 +162,40 @@ class PrefetchRequestScheduler(
 
     /**
      * Called when Media3 begins loading a resource.
-     * Prevents duplicate upstream downloads and coordinates single-writer cache access.
+     * Cancels any overlapping background prefetch and coordinates single-writer cache access.
      */
     fun onMedia3RequestStarting(identity: PrefetchRequestIdentity): PrefetchRequest? {
         media3ActiveRequests.add(identity)
-        val inFlight = registry[identity]
-        if (inFlight != null) {
-            inFlight.priority = PrefetchRequest.Priority.IMMEDIATE
-            if (inFlight.status == PrefetchRequest.Status.RUNNING) {
-                // If it just started or has low progress, cancel prefetch writer so Media3 takes over without contention
-                val bytesDone = inFlight.bytesDownloaded
-                if (bytesDone < 64 * 1024L) {
+
+        var matchedRequest: PrefetchRequest? = null
+        var latchToAwait: CountDownLatch? = null
+
+        synchronized(lock) {
+            val inFlight = registry[identity]
+            if (inFlight != null) {
+                matchedRequest = inFlight
+                inFlight.priority = PrefetchRequest.Priority.IMMEDIATE
+
+                if (inFlight.status == PrefetchRequest.Status.QUEUED) {
+                    priorityQueue.remove(inFlight)
+                    inFlight.status = PrefetchRequest.Status.CANCELLED
+                    cancelledCount.incrementAndGet()
+                } else if (inFlight.status == PrefetchRequest.Status.RUNNING) {
+                    // Cancel the background prefetch writer so Media3 takes over without conflicting span locks
                     activeWriters[inFlight.id]?.cancel()
+                    latchToAwait = activeWorkerLatches[inFlight.id]
                 }
-            } else if (inFlight.status == PrefetchRequest.Status.QUEUED) {
-                // Dequeue so prefetch worker does not duplicate Media3's load
-                synchronized(priorityQueue) { priorityQueue.remove(inFlight) }
-                inFlight.status = PrefetchRequest.Status.CANCELLED
             }
         }
-        return inFlight
+
+        // Await background writer shutdown on loader thread (never on main thread)
+        latchToAwait?.let { latch ->
+            runCatching {
+                latch.await(HANDOFF_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }
+        }
+
+        return matchedRequest
     }
 
     fun onMedia3RequestFinished(identity: PrefetchRequestIdentity) {
@@ -184,34 +203,31 @@ class PrefetchRequestScheduler(
     }
 
     /**
-     * Promotes or cancels requests on playback seek.
+     * Cancels requests obsolete due to a playback seek.
      */
-    suspend fun onSeek(newPositionUs: Long) {
-        queueMutex.withLock {
+    fun onSeek(newPositionUs: Long) {
+        val obsoleteRequests = mutableListOf<PrefetchRequest>()
+
+        synchronized(lock) {
             val iterator = priorityQueue.iterator()
             while (iterator.hasNext()) {
                 val req = iterator.next()
-                // Drop obsolete requests far behind the new seek position
                 if (!req.isInit && req.mediaTimeUs < newPositionUs - 10_000_000L) {
                     iterator.remove()
                     req.status = PrefetchRequest.Status.CANCELLED
                     cancelledCount.incrementAndGet()
+                    obsoleteRequests += req
                 }
             }
         }
 
-        // Cancel running requests that are far behind the seek point
-        for ((id, writer) in activeWriters) {
-            val req = registry.values.firstOrNull { it.id == id } ?: continue
-            if (!req.isInit && req.mediaTimeUs < newPositionUs - 10_000_000L) {
-                writer.cancel()
-                req.status = PrefetchRequest.Status.CANCELLED
-                cancelledCount.incrementAndGet()
-            }
+        for (req in obsoleteRequests) {
+            activeWriters[req.id]?.cancel()
         }
     }
 
     private fun ensureWorkerPool() {
+        if (isReleased.get()) return
         val target = targetWorkers.get()
         for (i in 0 until target) {
             if (activeWorkerJobs[i]?.isActive != true) {
@@ -223,9 +239,8 @@ class PrefetchRequestScheduler(
     }
 
     private suspend fun runWorkerLoop(workerIndex: Int) {
-        while (scope.isActive && session.lifecycle != PlaybackSessionState.Lifecycle.RELEASED) {
+        while (scope.isActive && !isReleased.get() && session.lifecycle != PlaybackSessionState.Lifecycle.RELEASED) {
             if (workerIndex >= targetWorkers.get()) {
-                // Worker count was reduced, exit this extra worker
                 break
             }
 
@@ -234,7 +249,7 @@ class PrefetchRequestScheduler(
                 continue
             }
 
-            val request = queueMutex.withLock {
+            val request = synchronized(lock) {
                 priorityQueue.poll()
             }
 
@@ -245,8 +260,7 @@ class PrefetchRequestScheduler(
 
             // Check if storage capacity or disk space is full
             if (!hasAvailableStorage(request)) {
-                // Requeue with delay or wait
-                queueMutex.withLock {
+                synchronized(lock) {
                     if (!request.isTerminal()) {
                         priorityQueue.offer(request)
                     }
@@ -267,7 +281,7 @@ class PrefetchRequestScheduler(
             return
         }
 
-        // Check if already cached
+        // Verify if already cached
         val length = if (request.identity.length > 0) request.identity.length else 1L
         if (cache.isCached(request.identity.cacheKey, request.identity.position, length)) {
             cacheHitCount.incrementAndGet()
@@ -275,9 +289,15 @@ class PrefetchRequestScheduler(
             return
         }
 
+        val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
+        reservedBytes.addAndGet(estimatedBytes)
+
         cacheMissCount.incrementAndGet()
         request.status = PrefetchRequest.Status.RUNNING
         activeWorkerCount.incrementAndGet()
+
+        val latch = CountDownLatch(1)
+        activeWorkerLatches[request.id] = latch
 
         // Acquire active session lease while downloading
         val lease = session.acquireLease(
@@ -319,19 +339,26 @@ class PrefetchRequestScheduler(
                 if (request.retryCount < MAX_RETRIES && isRetryableError(e)) {
                     request.retryCount++
                     request.status = PrefetchRequest.Status.QUEUED
-                    queueMutex.withLock { priorityQueue.offer(request) }
+                    synchronized(lock) { priorityQueue.offer(request) }
                 }
             }
         } finally {
             activeWriters.remove(request.id)
+            activeWorkerLatches.remove(request.id)
+            latch.countDown()
+
+            reservedBytes.addAndGet(-estimatedBytes)
             activeWorkerCount.decrementAndGet()
             session.releaseLease(lease)
             runCatching { cacheDataSource.close() }
         }
     }
 
-    private fun hasAvailableStorage(request: PrefetchRequest): Boolean {
-        // Guard device filesystem free space
+    /**
+     * Storage-limit check: Ensures background prefetch NEVER bypasses the configured limit.
+     */
+    fun hasAvailableStorage(request: PrefetchRequest): Boolean {
+        // 1. Guard device filesystem free space
         val freeDisk = runCatching {
             StatFs(context.cacheDir.absolutePath).availableBytes
         }.getOrDefault(Long.MAX_VALUE)
@@ -341,18 +368,23 @@ class PrefetchRequestScheduler(
             return false
         }
 
-        // Guard PlaybackCacheManager capacity limit
+        // 2. Guard PlaybackCacheManager limit
         val currentUsage = PlaybackCacheManager.usageBytes()
-        val maxAllowed = if (session.prefetchLimitBytes > 0L) {
+        val limit = if (session.prefetchLimitBytes > 0L) {
             session.prefetchLimitBytes
         } else {
             PlaybackCacheManager.maxBytes()
         }
 
-        if (maxAllowed > 0L && currentUsage >= maxAllowed) {
-            // Only allow top priority requests when near capacity
-            return request.priority == PrefetchRequest.Priority.IMMEDIATE ||
-                request.priority == PrefetchRequest.Priority.NEXT_MEDIA
+        val totalUsedAndReserved = currentUsage + reservedBytes.get()
+
+        if (limit > 0L && totalUsedAndReserved >= limit) {
+            // ONLY genuine Media3 playback requests may proceed when at or over the budget
+            val isMedia3Playback = request.priority == PrefetchRequest.Priority.IMMEDIATE &&
+                media3ActiveRequests.contains(request.identity)
+
+            // Background prefetch (NEXT_MEDIA, FORWARD_MEDIA, USEFUL_PREFETCH, SPECULATIVE) is strictly blocked
+            return isMedia3Playback
         }
 
         return true
@@ -363,7 +395,6 @@ class PrefetchRequestScheduler(
         val currentBps = (bytes * 8000L) / durationMs
         consecutiveSuccesses++
 
-        // If network is consistently fast and queue has pending work, adaptively increase workers
         if (consecutiveSuccesses >= 3 && targetWorkers.get() < MAX_WORKERS) {
             if (lastMeasuredThroughputBps > 0 && currentBps >= (lastMeasuredThroughputBps * 0.9)) {
                 val newTarget = min(MAX_WORKERS, targetWorkers.incrementAndGet())
@@ -385,7 +416,6 @@ class PrefetchRequestScheduler(
             val now = clock()
             if (now - lastBackoffTimeMs.get() > BACKOFF_DELAY_MS) {
                 lastBackoffTimeMs.set(now)
-                // Drop concurrency to minimum on server throttling
                 targetWorkers.set(MIN_WORKERS)
                 Log.w(TAG, "rate limit or timeout detected, reducing concurrency to $MIN_WORKERS")
                 scope.launch {
@@ -405,14 +435,26 @@ class PrefetchRequestScheduler(
     }
 
     fun release() {
-        for ((_, writer) in activeWriters) {
-            runCatching { writer.cancel() }
+        if (isReleased.compareAndSet(false, true)) {
+            for ((_, writer) in activeWriters) {
+                runCatching { writer.cancel() }
+            }
+            activeWriters.clear()
+            activeWorkerLatches.values.forEach { it.countDown() }
+            activeWorkerLatches.clear()
+
+            for ((_, job) in activeWorkerJobs) {
+                job.cancel()
+            }
+            activeWorkerJobs.clear()
+
+            media3ActiveRequests.clear()
+            synchronized(lock) {
+                priorityQueue.clear()
+            }
+            registry.clear()
+            reservedBytes.set(0L)
+            scope.cancel()
         }
-        activeWriters.clear()
-        media3ActiveRequests.clear()
-        synchronized(priorityQueue) {
-            priorityQueue.clear()
-        }
-        registry.clear()
     }
 }
