@@ -28,6 +28,8 @@ class PlaybackSessionState(
     var sourceUri: String? = null,
     var isLive: Boolean = false,
     val clock: () -> Long = { SystemClock.elapsedRealtime() },
+    val prefetchModeEnabled: Boolean = false,
+    val prefetchLimitBytes: Long = 0L,
 ) {
     enum class MediaType {
         PROGRESSIVE,
@@ -111,6 +113,9 @@ class PlaybackSessionState(
 
     // Active resource leases
     private val activeLeases = ConcurrentHashMap<String, CacheLease>()
+
+    // Optional prefetch coordinator for this session
+    var prefetchCoordinator: PlaybackPrefetchCoordinator? = null
 
     // Dedicated network monitor for this session
     val networkMonitor: PlaybackNetworkMonitor = PlaybackNetworkMonitor(sessionId, clock)
@@ -273,6 +278,8 @@ class PlaybackSessionState(
     fun release() {
         if (lifecycle == Lifecycle.RELEASED) return
         lifecycle = Lifecycle.RELEASING
+        prefetchCoordinator?.release()
+        prefetchCoordinator = null
         clearLeases()
         networkMonitor.reset()
         lifecycle = Lifecycle.RELEASED

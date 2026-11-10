@@ -184,6 +184,8 @@ class PlayerPreferences(preferences: PreferenceStore) {
     val bufferDiskMB = preferences.getInt("video_buffer_disk_key", 0)
     val bufferRamMB = preferences.getInt("video_buffer_size_key", 0)
     val bufferTimeSec = preferences.getInt("video_buffer_length_key", 0)
+    val prefetchModeEnabled = preferences.getBoolean("prefetch_mode_enabled_key", false)
+    val prefetchLimitMB = preferences.getInt("prefetch_limit_mb_key", 1024)
     val tvSeekOnTime = preferences.getInt("android_tv_interface_on_seek_key", 10)
     val tvSeekOffTime = preferences.getInt("android_tv_interface_off_seek_key", 10)
 }

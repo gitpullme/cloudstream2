@@ -5,6 +5,7 @@ import android.text.format.Formatter.formatShortFileSize
 import android.view.View
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
+import androidx.preference.SwitchPreferenceCompat
 import com.lagradost.cloudstream3.R
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.mvvm.logError
@@ -31,6 +32,45 @@ import com.lagradost.cloudstream3.utils.SingleSelectionHelper.showMultiDialog
 import com.lagradost.cloudstream3.utils.UIHelper.hideKeyboard
 
 class SettingsPlayer : BasePreferenceFragmentCompat() {
+    override fun onResume() {
+        super.onResume()
+        refreshPrefetchUi()
+    }
+
+    private fun refreshPrefetchUi() {
+        val ctx = context ?: return
+        val settingsManager = PreferenceManager.getDefaultSharedPreferences(ctx)
+        val isEnabled = settingsManager.getBoolean(getString(R.string.prefetch_mode_enabled_key), false)
+
+        val prefetchLimitPref = getPref(R.string.prefetch_limit_mb_key)
+        val diskPref = getPref(R.string.video_buffer_disk_key)
+        val ramPref = getPref(R.string.video_buffer_size_key)
+        val lengthPref = getPref(R.string.video_buffer_length_key)
+
+        prefetchLimitPref?.isEnabled = isEnabled
+        diskPref?.isEnabled = !isEnabled
+        ramPref?.isEnabled = !isEnabled
+        lengthPref?.isEnabled = !isEnabled
+
+        if (isEnabled) {
+            val managedText = getString(R.string.managed_by_prefetch_mode)
+            diskPref?.summary = managedText
+            ramPref?.summary = managedText
+            lengthPref?.summary = managedText
+        } else {
+            diskPref?.summary = getString(R.string.video_disk_description)
+            ramPref?.summary = getString(R.string.video_ram_description)
+            lengthPref?.summary = getString(R.string.video_ram_description)
+        }
+
+        val limitMb = settingsManager.getInt(getString(R.string.prefetch_limit_mb_key), 1024)
+        val limitValues = resources.getIntArray(R.array.prefetch_limit_values)
+        val limitNames = resources.getStringArray(R.array.prefetch_limit_names)
+        val idx = limitValues.indexOf(limitMb)
+        val limitLabel = if (idx >= 0 && idx < limitNames.size) limitNames[idx] else "${limitMb}MB"
+        prefetchLimitPref?.summary = "$limitLabel\n${getString(R.string.prefetch_limit_description)}"
+    }
+
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         setUpToolbar(R.string.category_player)
@@ -262,6 +302,35 @@ class SettingsPlayer : BasePreferenceFragmentCompat() {
             }
             return@setOnPreferenceClickListener true
         }
+
+        val prefetchModePref = getPref(R.string.prefetch_mode_enabled_key) as? SwitchPreferenceCompat
+        prefetchModePref?.setOnPreferenceChangeListener { _, newValue ->
+            val isEnabled = newValue as? Boolean ?: false
+            (view?.post { refreshPrefetchUi() } ?: refreshPrefetchUi())
+            true
+        }
+
+        getPref(R.string.prefetch_limit_mb_key)?.setOnPreferenceClickListener {
+            val prefNames = resources.getStringArray(R.array.prefetch_limit_names)
+            val prefValues = resources.getIntArray(R.array.prefetch_limit_values)
+            val currentPref = settingsManager.getInt(getString(R.string.prefetch_limit_mb_key), 1024)
+
+            activity?.showDialog(
+                prefNames.toList(),
+                prefValues.indexOf(currentPref),
+                getString(R.string.prefetch_limit_settings),
+                true,
+                {}
+            ) {
+                settingsManager.edit {
+                    putInt(getString(R.string.prefetch_limit_mb_key), prefValues[it])
+                }
+                refreshPrefetchUi()
+            }
+            return@setOnPreferenceClickListener true
+        }
+
+        refreshPrefetchUi()
 
         getPref(R.string.video_buffer_disk_key)?.setOnPreferenceClickListener {
             val prefNames = resources.getStringArray(R.array.video_buffer_size_names)

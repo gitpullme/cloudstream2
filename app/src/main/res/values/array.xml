@@ -197,6 +197,26 @@
         <item>500</item>
     </array>
 
+    <array name="prefetch_limit_names">
+        <item>@string/automatic</item>
+        <item>128MB</item>
+        <item>256MB</item>
+        <item>512MB</item>
+        <item>1GB</item>
+        <item>1.5GB</item>
+        <item>2GB</item>
+    </array>
+
+    <array name="prefetch_limit_values">
+        <item>0</item>
+        <item>128</item>
+        <item>256</item>
+        <item>512</item>
+        <item>1024</item>
+        <item>1536</item>
+        <item>2048</item>
+    </array>
+
     <array name="poster_ui_options">
         <item>@string/show_hd</item>
         <item>@string/show_dub</item>

@@ -30,6 +30,7 @@ import com.lagradost.cloudstream4.compose.isLayout
 import com.lagradost.cloudstream4.rememberAppSettings
 import com.mihon.presentation.settings.Preference
 import com.mihon.presentation.settings.SearchableSettings
+import com.mihon.presentation.settings.collectAsState
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -52,6 +53,8 @@ object SettingsPlayerScreen : SearchableSettings {
                         ?: player::class.simpleName ?: player::class.jvmName)
                 }
         }
+
+        val prefetchModeEnabled by settings.player.prefetchModeEnabled.collectAsState()
 
         var cacheSize by remember { mutableLongStateOf(0L) }
         var cacheCleared by remember { mutableIntStateOf(0) }
@@ -312,11 +315,35 @@ object SettingsPlayerScreen : SearchableSettings {
             Preference.PreferenceGroup(
                 title = stringResource(R.string.pref_category_cache),
                 preferenceItems = persistentListOf(
+                    Preference.PreferenceItem.SwitchPreference(
+                        preference = settings.player.prefetchModeEnabled,
+                        title = stringResource(R.string.prefetch_mode_settings),
+                        subtitle = stringResource(R.string.prefetch_mode_description),
+                        icon = painterResource(R.drawable.hard_drive_24px),
+                        enabled = true,
+                    ),
+
+                    Preference.PreferenceItem.ListPreference(
+                        preference = settings.player.prefetchLimitMB,
+                        title = stringResource(R.string.prefetch_limit_settings),
+                        subtitle = "%s\n" + stringResource(R.string.prefetch_limit_description),
+                        icon = painterResource(R.drawable.hard_drive_24px),
+                        enabled = prefetchModeEnabled,
+                        entries = integerArrayResource(R.array.prefetch_limit_values).zip(
+                            stringArrayResource(R.array.prefetch_limit_names)
+                        ).toMap()
+                    ),
+
                     Preference.PreferenceItem.ListPreference(
                         preference = settings.player.bufferDiskMB,
                         title = stringResource(R.string.video_buffer_disk_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_disk_description),
+                        subtitle = if (prefetchModeEnabled) {
+                            stringResource(R.string.managed_by_prefetch_mode)
+                        } else {
+                            "%s\n" + stringResource(R.string.video_disk_description)
+                        },
                         icon = painterResource(R.drawable.hard_drive_24px),
+                        enabled = !prefetchModeEnabled,
                         entries = integerArrayResource(R.array.video_buffer_size_values).zip(
                             stringArrayResource(R.array.video_buffer_size_names)
                         ).toMap()
@@ -325,8 +352,13 @@ object SettingsPlayerScreen : SearchableSettings {
                     Preference.PreferenceItem.ListPreference(
                         preference = settings.player.bufferRamMB,
                         title = stringResource(R.string.video_buffer_size_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_ram_description),
+                        subtitle = if (prefetchModeEnabled) {
+                            stringResource(R.string.managed_by_prefetch_mode)
+                        } else {
+                            "%s\n" + stringResource(R.string.video_ram_description)
+                        },
                         icon = painterResource(R.drawable.memory_alt_24px),
+                        enabled = !prefetchModeEnabled,
                         entries = integerArrayResource(R.array.video_buffer_size_values).zip(
                             stringArrayResource(R.array.video_buffer_size_names)
                         ).toMap()
@@ -335,8 +367,13 @@ object SettingsPlayerScreen : SearchableSettings {
                     Preference.PreferenceItem.ListPreference(
                         preference = settings.player.bufferTimeSec,
                         title = stringResource(R.string.video_buffer_length_settings),
-                        subtitle = "%s\n" + stringResource(R.string.video_ram_description),
+                        subtitle = if (prefetchModeEnabled) {
+                            stringResource(R.string.managed_by_prefetch_mode)
+                        } else {
+                            "%s\n" + stringResource(R.string.video_ram_description)
+                        },
                         icon = painterResource(R.drawable.history_toggle_off_24px),
+                        enabled = !prefetchModeEnabled,
                         entries = integerArrayResource(R.array.video_buffer_length_values).zip(
                             stringArrayResource(R.array.video_buffer_length_names)
                         ).toMap()
@@ -348,12 +385,14 @@ object SettingsPlayerScreen : SearchableSettings {
                         subtitle = formatShortFileSize(LocalContext.current, cacheSize),
                         onClick = {
                             ioSafe {
-                                // Use Media3's cache API instead of deleting files under a live
-                                // SimpleCache. The active title's spans are protected by the
-                                // manager even when audio-only playback is in the background.
+                                val diskMb = if (prefetchModeEnabled) {
+                                    settings.player.prefetchLimitMB.get()
+                                } else {
+                                    settings.player.bufferDiskMB.get()
+                                }
                                 PlaybackCacheManager.get(
                                     context.applicationContext,
-                                    settings.player.bufferDiskMB.get().toLong() * 1024L * 1024L,
+                                    diskMb.toLong() * 1024L * 1024L,
                                 )
                                 PlaybackCacheManager.clearAll()
                                 SingletonImageLoader.get(context).diskCache?.clear()

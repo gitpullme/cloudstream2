@@ -177,6 +177,19 @@
     </PreferenceCategory>
 
     <PreferenceCategory android:title="@string/pref_category_cache">
+        <SwitchPreferenceCompat
+            android:defaultValue="false"
+            android:icon="@drawable/ic_baseline_storage_24"
+            android:key="@string/prefetch_mode_enabled_key"
+            android:summary="@string/prefetch_mode_description"
+            android:title="@string/prefetch_mode_settings" />
+
+        <Preference
+            android:icon="@drawable/ic_baseline_storage_24"
+            android:key="@string/prefetch_limit_mb_key"
+            android:summary="@string/prefetch_limit_description"
+            android:title="@string/prefetch_limit_settings" />
+
         <Preference
             android:icon="@drawable/ic_baseline_storage_24"
             android:key="@string/video_buffer_disk_key"

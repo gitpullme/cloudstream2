@@ -400,12 +400,12 @@ class PlayerView @JvmOverloads constructor(
                 val ctx = context
                 val settingsManager = PreferenceManager.getDefaultSharedPreferences(ctx)
                 val cs3 = player as? CS3IPlayer ?: return
-                cs3.cacheSize =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_size_key), 0) * 1024L * 1024L
-                cs3.simpleCacheSize =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_disk_key), 0) * 1024L * 1024L
-                cs3.videoBufferMs =
-                    settingsManager.getInt(context.getString(R.string.video_buffer_length_key), 0) * 1000L
+                val config = PlayerBufferConfigResolver.resolveFromPreferences(ctx, settingsManager)
+                cs3.prefetchModeEnabled = config.prefetchModeEnabled
+                cs3.prefetchLimitMb = config.prefetchLimitMb
+                cs3.cacheSize = config.ramBudgetBytes
+                cs3.simpleCacheSize = config.simpleCacheSizeBytes
+                cs3.videoBufferMs = config.bufferDurationMs
             } catch (e: Exception) {
                 logError(e)
             }

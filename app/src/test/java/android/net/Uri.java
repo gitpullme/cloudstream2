@@ -33,7 +33,8 @@ public abstract class Uri implements Comparable<Uri>, Serializable {
     }
 
     public static Uri fromFile(java.io.File file) {
-        return parse("file://" + file.getAbsolutePath());
+        if (file == null) return null;
+        return new FileUri(file);
     }
 
     @Override
@@ -179,13 +180,21 @@ public abstract class Uri implements Comparable<Uri>, Serializable {
             }
 
             if (scheme != null) {
-                int slashIdx = rest.indexOf('/');
-                if (slashIdx != -1) {
-                    this.authority = rest.substring(0, slashIdx);
-                    this.path = rest.substring(slashIdx);
+                if ("file".equalsIgnoreCase(scheme)) {
+                    this.authority = null;
+                    if (rest.startsWith("///")) {
+                        rest = rest.substring(2);
+                    }
+                    this.path = rest;
                 } else {
-                    this.authority = rest;
-                    this.path = "";
+                    int slashIdx = rest.indexOf('/');
+                    if (slashIdx != -1) {
+                        this.authority = rest.substring(0, slashIdx);
+                        this.path = rest.substring(slashIdx);
+                    } else {
+                        this.authority = rest;
+                        this.path = "";
+                    }
                 }
             } else {
                 this.authority = null;
@@ -229,6 +238,31 @@ public abstract class Uri implements Comparable<Uri>, Serializable {
                 .path(path)
                 .encodedQuery(query)
                 .fragment(fragment);
+        }
+    }
+
+    private static class FileUri extends Uri {
+        private final java.io.File file;
+
+        public FileUri(java.io.File file) {
+            this.file = file;
+        }
+
+        @Override public String getScheme() { return "file"; }
+        @Override public String getAuthority() { return null; }
+        @Override public String getEncodedAuthority() { return null; }
+        @Override public String getHost() { return null; }
+        @Override public int getPort() { return -1; }
+        @Override public String getPath() { return file.getAbsolutePath(); }
+        @Override public String getQuery() { return null; }
+        @Override public String getFragment() { return null; }
+        @Override public String toString() { return "file://" + file.getAbsolutePath(); }
+
+        @Override
+        public Builder buildUpon() {
+            return new Builder()
+                .scheme("file")
+                .path(file.getAbsolutePath());
         }
     }
 }

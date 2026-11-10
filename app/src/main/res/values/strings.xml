@@ -338,6 +338,11 @@
     <string name="video_buffer_size_settings">Video buffer size</string>
     <string name="video_buffer_length_settings">Video buffer length</string>
     <string name="video_buffer_disk_settings">Video cache on disk</string>
+    <string name="prefetch_mode_settings">Prefetch Mode</string>
+    <string name="prefetch_mode_description">Download upcoming media ahead of playback and reuse it from disk. CloudStream automatically manages buffering and download scheduling.</string>
+    <string name="prefetch_limit_settings">Prefetch Storage Limit</string>
+    <string name="prefetch_limit_description">Maximum disk storage available for prefetched and playback-cached media.</string>
+    <string name="managed_by_prefetch_mode">Managed automatically while Prefetch Mode is enabled.</string>
     <string name="video_buffer_clear_settings">Clear video and image cache</string>
     <string name="android_tv_interface_on_seek_settings">Player Shown - Seek Amount</string>
     <string name="android_tv_interface_on_seek_settings_summary">The seek amount used when the player is visible</string>

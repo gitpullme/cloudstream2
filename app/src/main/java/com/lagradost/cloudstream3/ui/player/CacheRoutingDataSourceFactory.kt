@@ -48,6 +48,7 @@ class CacheRoutingDataSourceFactory(
         private val listeners = mutableListOf<TransferListener>()
         private var delegate: DataSource? = null
         private var currentLease: PlaybackSessionState.CacheLease? = null
+        private var currentPrefetchIdentity: PrefetchRequestIdentity? = null
 
         override fun addTransferListener(transferListener: TransferListener) {
             if (!listeners.contains(transferListener)) {
@@ -61,6 +62,20 @@ class CacheRoutingDataSourceFactory(
             closeInternal()
 
             val cacheKey = dataSpec.key ?: dataSpec.uri.toString()
+
+            val prefetchCoordinator = session?.prefetchCoordinator
+            if (prefetchCoordinator != null) {
+                val identity = PrefetchRequestIdentity(
+                    uri = dataSpec.uri,
+                    cacheKey = cacheKey,
+                    position = dataSpec.position,
+                    length = dataSpec.length,
+                    httpMethod = if (dataSpec.httpMethod == DataSpec.HTTP_METHOD_POST) "POST" else "GET",
+                    headers = dataSpec.httpRequestHeaders,
+                )
+                currentPrefetchIdentity = identity
+                prefetchCoordinator.scheduler.onMedia3RequestStarting(identity)
+            }
 
             // Non-GET requests (DRM license POST, telemetry) must never be cached
             val isGet = dataSpec.httpMethod == DataSpec.HTTP_METHOD_GET
@@ -86,9 +101,13 @@ class CacheRoutingDataSourceFactory(
             return try {
                 source.open(dataSpec)
             } catch (e: Exception) {
-                // Release active lease immediately on open failure
+                // Release active lease and prefetch identity immediately on open failure
                 currentLease?.let { session?.releaseLease(it) }
                 currentLease = null
+                currentPrefetchIdentity?.let {
+                    session?.prefetchCoordinator?.scheduler?.onMedia3RequestFinished(it)
+                }
+                currentPrefetchIdentity = null
                 throw if (e is IOException) e else IOException("Failed to open DataSource", e)
             }
         }
@@ -116,6 +135,12 @@ class CacheRoutingDataSourceFactory(
             currentLease = null
             if (lease != null && session != null) {
                 session.releaseLease(lease)
+            }
+
+            val identity = currentPrefetchIdentity
+            currentPrefetchIdentity = null
+            if (identity != null && session != null) {
+                session.prefetchCoordinator?.scheduler?.onMedia3RequestFinished(identity)
             }
 
             val source = delegate

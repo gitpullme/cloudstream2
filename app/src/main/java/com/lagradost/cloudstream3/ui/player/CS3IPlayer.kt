@@ -152,6 +152,8 @@ class CS3IPlayer : IPlayer {
     var cacheSize = 0L
     var simpleCacheSize = 0L
     var videoBufferMs = 0L
+    var prefetchModeEnabled = false
+    var prefetchLimitMb = 1024
 
     val imageGenerator = IPreviewGenerator.new()
 
@@ -939,6 +941,7 @@ class CS3IPlayer : IPlayer {
     override fun seekTo(time: Long, source: PlayerEventSource) {
         if (isMediaSeekable) {
             updatedTime(time, source)
+            activeSession?.prefetchCoordinator?.onSeek(time * 1000L)
             exoPlayer?.seekTo(time)
         } else {
             Log.i(TAG, "Media is not seekable, we can not seek to $time")
@@ -947,8 +950,10 @@ class CS3IPlayer : IPlayer {
 
     private fun ExoPlayer.seekTime(time: Long, source: PlayerEventSource) {
         if (isMediaSeekable) {
-            updatedTime(currentPosition + time, source)
-            seekTo(currentPosition + time)
+            val target = currentPosition + time
+            updatedTime(target, source)
+            activeSession?.prefetchCoordinator?.onSeek(target * 1000L)
+            seekTo(target)
         } else {
             Log.i(TAG, "Media is not seekable, we can not seek to $time")
         }
@@ -1118,6 +1123,8 @@ class CS3IPlayer : IPlayer {
         val session = PlaybackSessionState(
             sourceUri = firstSourceUri,
             isLive = false,
+            prefetchModeEnabled = prefetchModeEnabled,
+            prefetchLimitBytes = simpleCacheSize,
         ).apply {
             setSource(firstSourceUri, isPlaylistSource = isPlaylist, live = false)
         }.also { activeSession = it }
@@ -1341,15 +1348,31 @@ class CS3IPlayer : IPlayer {
                 // Cache initialization failed; playback must still work without it.
                 upstream
             } else {
+                val keyFactory = HeaderAwareCacheKeyFactory(onlineSource.headers)
                 val cacheFactory = CacheDataSource.Factory().apply {
                     setCache(cache)
                     setUpstreamDataSourceFactory(upstream)
-                    setCacheKeyFactory(HeaderAwareCacheKeyFactory(onlineSource.headers))
+                    setCacheKeyFactory(keyFactory)
                     // A full disk or a failed cache write must degrade to network playback, not
                     // abort the title.
                     setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
                     loadControl?.let { setEventListener(it.cacheEventListener) }
                 }
+
+                if (prefetchModeEnabled) {
+                    val coordinator = PlaybackPrefetchCoordinator(
+                        context = context,
+                        session = session,
+                        playerProvider = { exoPlayer },
+                        getCache = { PlaybackCacheManager.get(context, simpleCacheSize) },
+                        getCacheDataSourceFactory = { cacheFactory },
+                        upstreamFactory = upstream,
+                        defaultHeaders = onlineSource.headers,
+                        cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
+                    )
+                    session.prefetchCoordinator = coordinator
+                }
+
                 CacheRoutingDataSourceFactory(
                     cacheFactory = cacheFactory,
                     upstreamFactory = upstream,
@@ -1705,7 +1728,7 @@ class CS3IPlayer : IPlayer {
                     activeLoadControl?.playbackState = playbackState
                     when (playbackState) {
                         Player.STATE_READY -> {
-
+                            activeSession?.prefetchCoordinator?.start()
                         }
 
                         Player.STATE_ENDED -> {
@@ -1744,6 +1767,17 @@ class CS3IPlayer : IPlayer {
                     super.onRenderedFirstFrame()
                     onRenderFirst()
                     updatedTime(source = PlayerEventSource.Player)
+                }
+
+                override fun onPositionDiscontinuity(
+                    oldPosition: Player.PositionInfo,
+                    newPosition: Player.PositionInfo,
+                    reason: Int
+                ) {
+                    super.onPositionDiscontinuity(oldPosition, newPosition, reason)
+                    if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                        activeSession?.prefetchCoordinator?.onSeek(newPosition.positionMs * 1000L)
+                    }
                 }
             }.also { playerListener = it })
         } catch (t: Throwable) {
