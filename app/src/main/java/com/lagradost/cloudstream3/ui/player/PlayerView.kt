@@ -285,10 +285,13 @@ class PlayerView @JvmOverloads constructor(
         if (player is CS3IPlayer) {
             // Preview bar
             val progressBar: PreviewTimeBar? = exoPlayerView?.findViewById(R.id.exo_progress)
+                ?: exoPlayerView?.rootView?.findViewById(R.id.exo_progress)
             exoProgress = progressBar as? LivePreviewTimeBar
+            exoProgress?.registerPlayerView(exoPlayerView)
             val cs3 = player as? CS3IPlayer
             exoProgress?.prefetchModeEnabled = cs3?.prefetchModeEnabled == true
             cs3?.onPrefetchCoverageChanged = { posMs ->
+                exoProgress?.prefetchModeEnabled = cs3.prefetchModeEnabled
                 exoProgress?.setPrefetchPosition(posMs)
             }
             val previewImageView: ImageView? = exoPlayerView?.findViewById(R.id.previewImageView)
@@ -411,6 +414,7 @@ class PlayerView @JvmOverloads constructor(
                 cs3.cacheSize = config.ramBudgetBytes
                 cs3.simpleCacheSize = config.simpleCacheSizeBytes
                 cs3.videoBufferMs = config.bufferDurationMs
+                exoProgress?.prefetchModeEnabled = config.prefetchModeEnabled
             } catch (e: Exception) {
                 logError(e)
             }
@@ -649,6 +653,8 @@ class PlayerView @JvmOverloads constructor(
             @Suppress("DEPRECATION")
             exoPlayerView?.setShowMultiWindowTimeBar(true)
             exoPlayerView?.player = player
+            exoProgress?.player = player
+            exoProgress?.registerPlayerView(exoPlayerView)
             exoPlayerView?.performClick()
         }
         callbacks?.playerUpdated(player)

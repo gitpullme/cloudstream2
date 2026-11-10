@@ -115,10 +115,16 @@ class CacheRoutingDataSourceFactory(
             }
         }
 
+        private var hasReadEof = false
+
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
             val source = delegate ?: throw IOException("read() called before open()")
             return try {
-                source.read(buffer, offset, length)
+                val bytesRead = source.read(buffer, offset, length)
+                if (bytesRead < 0) {
+                    hasReadEof = true
+                }
+                bytesRead
             } catch (e: Exception) {
                 throw if (e is IOException) e else IOException("Failed to read from DataSource", e)
             }
@@ -143,6 +149,9 @@ class CacheRoutingDataSourceFactory(
             val identity = currentPrefetchIdentity
             currentPrefetchIdentity = null
             if (identity != null && session != null) {
+                if (hasReadEof) {
+                    CacheCoverageVerifier.markCompleted(identity.cacheKey)
+                }
                 session.prefetchCoordinator?.scheduler?.onMedia3RequestFinished(identity)
             }
 

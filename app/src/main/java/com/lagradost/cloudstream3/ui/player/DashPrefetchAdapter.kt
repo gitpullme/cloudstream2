@@ -39,7 +39,8 @@ class DashPrefetchAdapter(
     override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
         val matchesMime = mimeType == MimeTypes.APPLICATION_MPD
         val path = sourceUri.path?.lowercase() ?: ""
-        val matchesExt = path.endsWith(".mpd") || path.contains(".mpd")
+        val fullUri = sourceUri.toString().lowercase()
+        val matchesExt = path.endsWith(".mpd") || path.contains(".mpd") || fullUri.contains(".mpd")
         val hasManifest = manifest is DashManifest
 
         if (hasManifest || matchesMime || matchesExt) {

@@ -22,7 +22,8 @@ import kotlin.math.min
 class LivePreviewTimeBar(val ctx: Context, attrs: AttributeSet) : PreviewTimeBar(ctx, attrs) {
 
     private var _currentPlayerView: WeakReference<PlayerView>? = null
-    val currentPlayer: Player? get() = _currentPlayerView?.get()?.player
+    var player: Player? = null
+    val currentPlayer: Player? get() = player ?: _currentPlayerView?.get()?.player
 
     private var originalBufferedColor: Int = DefaultTimeBar.DEFAULT_BUFFERED_COLOR
     private var prefetchPositionMs: Long = 0L
@@ -45,7 +46,7 @@ class LivePreviewTimeBar(val ctx: Context, attrs: AttributeSet) : PreviewTimeBar
         }
 
     private val prefetchPaint = Paint().apply {
-        color = 0x8029B6F6.toInt() // Material Light Blue 400 at ~50% alpha
+        color = 0xFF29B6F6.toInt() // Material Light Blue 400 at 100% opacity for high visibility
         style = Paint.Style.FILL
         isAntiAlias = true
     }
@@ -84,6 +85,9 @@ class LivePreviewTimeBar(val ctx: Context, attrs: AttributeSet) : PreviewTimeBar
     fun setPrefetchPosition(positionMs: Long) {
         if (prefetchPositionMs != positionMs) {
             prefetchPositionMs = positionMs
+            if (prefetchModeEnabled) {
+                setBufferedColor(Color.TRANSPARENT)
+            }
             postInvalidate()
         }
     }

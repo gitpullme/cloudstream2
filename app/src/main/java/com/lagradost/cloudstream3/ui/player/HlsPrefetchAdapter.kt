@@ -56,9 +56,7 @@ class HlsPrefetchAdapter(
     private val cachedAudioPlaylists = ConcurrentHashMap<Uri, HlsMediaPlaylist>()
 
     override fun hasSeparateAudioTrack(): Boolean =
-        audioTopology == HlsAudioTopology.SEPARATE_AUDIO_REQUIRED ||
-        audioTopology == HlsAudioTopology.SEPARATE_AUDIO_READY ||
-        audioTopology == HlsAudioTopology.SEPARATE_AUDIO_UNAVAILABLE
+        audioTopology == HlsAudioTopology.SEPARATE_AUDIO_READY
 
     internal fun setAudioPlaylistForTesting(uri: Uri, playlist: HlsMediaPlaylist) {
         cachedAudioPlaylists[uri] = playlist
@@ -74,7 +72,8 @@ class HlsPrefetchAdapter(
     override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
         val matchesMime = mimeType == MimeTypes.APPLICATION_M3U8
         val path = sourceUri.path?.lowercase() ?: ""
-        val matchesExt = path.endsWith(".m3u8") || path.contains(".m3u8")
+        val fullUri = sourceUri.toString().lowercase()
+        val matchesExt = path.endsWith(".m3u8") || path.contains(".m3u8") || fullUri.contains(".m3u8")
         val hasManifest = manifest is HlsManifest || manifest is HlsMediaPlaylist
 
         if (hasManifest || matchesMime || matchesExt) {

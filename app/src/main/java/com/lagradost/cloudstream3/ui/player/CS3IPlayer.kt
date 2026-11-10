@@ -306,6 +306,17 @@ class CS3IPlayer : IPlayer {
         preview: Boolean,
     ) {
         Log.i(TAG, "loadPlayer")
+        runCatching {
+            val config = PlayerBufferConfigResolver.resolveFromPreferences(
+                context,
+                PreferenceManager.getDefaultSharedPreferences(context)
+            )
+            this@CS3IPlayer.prefetchModeEnabled = config.prefetchModeEnabled
+            this@CS3IPlayer.prefetchLimitMb = config.prefetchLimitMb
+            this@CS3IPlayer.cacheSize = config.ramBudgetBytes
+            this@CS3IPlayer.simpleCacheSize = config.simpleCacheSizeBytes
+            this@CS3IPlayer.videoBufferMs = config.bufferDurationMs
+        }
         if (sameEpisode) {
             saveData()
         } else {
@@ -1129,6 +1140,18 @@ class CS3IPlayer : IPlayer {
         oldSession?.release()
         onPrefetchCoverageChanged?.invoke(0L)
 
+        runCatching {
+            val config = PlayerBufferConfigResolver.resolveFromPreferences(
+                context,
+                PreferenceManager.getDefaultSharedPreferences(context)
+            )
+            this@CS3IPlayer.prefetchModeEnabled = config.prefetchModeEnabled
+            this@CS3IPlayer.prefetchLimitMb = config.prefetchLimitMb
+            this@CS3IPlayer.cacheSize = config.ramBudgetBytes
+            this@CS3IPlayer.simpleCacheSize = config.simpleCacheSizeBytes
+            this@CS3IPlayer.videoBufferMs = config.bufferDurationMs
+        }
+
         val session = PlaybackSessionState(
             sourceUri = firstSourceUri,
             isLive = false,
@@ -1386,6 +1409,7 @@ class CS3IPlayer : IPlayer {
                         }
                     }
                     session.prefetchCoordinator = coordinator
+                    coordinator.start()
                 }
 
                 CacheRoutingDataSourceFactory(
@@ -1736,6 +1760,7 @@ class CS3IPlayer : IPlayer {
                     if (isPlaying) {
                         event(RequestAudioFocusEvent())
                         onRenderFirst()
+                        activeSession?.prefetchCoordinator?.start()
                     }
                 }
 
@@ -1743,7 +1768,8 @@ class CS3IPlayer : IPlayer {
                     super.onPlaybackStateChanged(playbackState)
                     activeLoadControl?.playbackState = playbackState
                     when (playbackState) {
-                        Player.STATE_READY -> {
+                        Player.STATE_READY,
+                        Player.STATE_BUFFERING -> {
                             activeSession?.prefetchCoordinator?.start()
                         }
 

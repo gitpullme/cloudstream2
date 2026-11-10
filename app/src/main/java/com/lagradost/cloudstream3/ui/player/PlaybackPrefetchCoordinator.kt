@@ -387,7 +387,7 @@ class PlaybackPrefetchCoordinator(
         val audioRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_AUDIO }
 
         val contiguousVideoEndUs = computeContiguousSpanEnd(cache, videoRanges, playheadUs)
-        val hasSeparateAudio = activeAdapter?.hasSeparateAudioTrack() == true
+        val hasSeparateAudio = activeAdapter?.hasSeparateAudioTrack() == true && audioRanges.isNotEmpty()
 
         val offlinePlayableUs = if (hasSeparateAudio) {
             val contiguousAudioEndUs = computeContiguousSpanEnd(cache, audioRanges, playheadUs)

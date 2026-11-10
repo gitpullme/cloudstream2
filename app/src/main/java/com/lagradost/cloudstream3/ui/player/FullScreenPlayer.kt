@@ -1560,6 +1560,7 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
             }
 
             exoProgress.registerPlayerView(playerView)
+            exoProgress.prefetchModeEnabled = (player as? CS3IPlayer)?.prefetchModeEnabled == true
 
             @SuppressLint("ClickableViewAccessibility")
             exoProgress.setOnTouchListener { _, event ->
