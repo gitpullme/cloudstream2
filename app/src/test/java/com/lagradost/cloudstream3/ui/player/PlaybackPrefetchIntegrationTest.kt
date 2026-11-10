@@ -1002,4 +1002,216 @@ class PlaybackPrefetchIntegrationTest {
         coordinatorB.release()
         sessionB.release()
     }
+
+    @Test
+    fun `critical acceptance test - real controllable HTTP server offline HLS dual-track playback with zero network requests after shutdown`() = runBlocking {
+        val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        val port = server.address.port
+        val baseUrl = "http://127.0.0.1:$port"
+
+        val masterPlaylist = """
+            #EXTM3U
+            #EXT-X-VERSION:4
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"
+            #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO="audio"
+            video.m3u8
+        """.trimIndent()
+
+        val videoPlaylist = """
+            #EXTM3U
+            #EXT-X-VERSION:4
+            #EXT-X-TARGETDURATION:6
+            #EXT-X-MEDIA-SEQUENCE:0
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXTINF:6.0,
+            video_0.ts
+            #EXTINF:6.0,
+            video_1.ts
+            #EXT-X-ENDLIST
+        """.trimIndent()
+
+        val audioPlaylist = """
+            #EXTM3U
+            #EXT-X-VERSION:4
+            #EXT-X-TARGETDURATION:6
+            #EXT-X-MEDIA-SEQUENCE:0
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXTINF:6.0,
+            audio_0.ts
+            #EXTINF:6.0,
+            audio_1.ts
+            #EXT-X-ENDLIST
+        """.trimIndent()
+
+        val video0Data = ByteArray(64 * 1024) { 0x47 }
+        val video1Data = ByteArray(64 * 1024) { 0x47 }
+        val audio0Data = ByteArray(32 * 1024) { 0x47 }
+        val audio1Data = ByteArray(32 * 1024) { 0x47 }
+
+        val serverHitCount = AtomicInteger(0)
+
+        server.createContext("/") { exchange ->
+            serverHitCount.incrementAndGet()
+            val path = exchange.requestURI.path
+            val (status, body) = when (path) {
+                "/master.m3u8" -> 200 to masterPlaylist.toByteArray(Charsets.UTF_8)
+                "/video.m3u8" -> 200 to videoPlaylist.toByteArray(Charsets.UTF_8)
+                "/audio.m3u8" -> 200 to audioPlaylist.toByteArray(Charsets.UTF_8)
+                "/video_0.ts" -> 200 to video0Data
+                "/video_1.ts" -> 200 to video1Data
+                "/audio_0.ts" -> 200 to audio0Data
+                "/audio_1.ts" -> 200 to audio1Data
+                else -> 404 to ByteArray(0)
+            }
+            exchange.sendResponseHeaders(status, body.size.toLong())
+            exchange.responseBody.use { it.write(body) }
+        }
+        server.start()
+
+        try {
+            val masterUri = Uri.parse("$baseUrl/master.m3u8")
+            val defaultHeaders = mapOf("User-Agent" to "CloudStreamRealServerTest")
+            val cacheKeyFactory = HeaderAwareCacheKeyFactory(defaultHeaders)
+
+            // Setup real upstream and cache data source factories
+            val upstreamFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+                .setDefaultRequestProperties(defaultHeaders)
+
+            val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+                setCache(simpleCache)
+                setUpstreamDataSourceFactory(upstreamFactory)
+                setCacheKeyFactory(cacheKeyFactory)
+                setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            }
+
+            val session = PlaybackSessionState(
+                sourceUri = masterUri.toString(),
+                prefetchModeEnabled = true,
+                prefetchLimitBytes = 50L * 1024L * 1024L,
+            )
+
+            val media3RoutingFactory = CacheRoutingDataSourceFactory(
+                cacheFactory = cacheDataSourceFactory,
+                upstreamFactory = upstreamFactory,
+                session = session,
+                cacheKeyFactory = { cacheKeyFactory.buildCacheKey(it) },
+            )
+
+            // Step 1: Real Prefetch Coordinator parses HLS and prefetches both tracks
+            val parsedMediaPlaylist = androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser().parse(
+                Uri.parse("$baseUrl/video.m3u8"),
+                videoPlaylist.byteInputStream()
+            ) as androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
+
+            val parsedMultivariant = androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser().parse(
+                masterUri,
+                masterPlaylist.byteInputStream()
+            ) as androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
+
+            val hlsManifest = androidx.media3.exoplayer.hls.HlsManifest::class.java.getDeclaredConstructor(
+                androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist::class.java,
+                androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist::class.java,
+            ).apply { isAccessible = true }.newInstance(parsedMultivariant, parsedMediaPlaylist)
+
+            val coordinator = PlaybackPrefetchCoordinator(
+                context = android.app.Application(),
+                session = session,
+                playerProvider = {
+                    java.lang.reflect.Proxy.newProxyInstance(
+                        androidx.media3.common.Player::class.java.classLoader,
+                        arrayOf(androidx.media3.common.Player::class.java),
+                    ) { _, method, _ ->
+                        when (method.name) {
+                            "getApplicationLooper" -> android.os.Looper.getMainLooper()
+                            "getCurrentPosition" -> 0L
+                            "getBufferedPosition" -> 0L
+                            "getDuration" -> 12_000L
+                            "getPlaybackState" -> androidx.media3.common.Player.STATE_READY
+                            "isPlaying" -> true
+                            "getPlayWhenReady" -> true
+                            "getCurrentManifest" -> hlsManifest
+                            "getCurrentTracks" -> null
+                            else -> null
+                        }
+                    } as androidx.media3.common.Player
+                },
+                getCache = { simpleCache },
+                getCacheDataSourceFactory = { cacheDataSourceFactory },
+                upstreamFactory = upstreamFactory,
+                cacheKeyFactory = { cacheKeyFactory.buildCacheKey(it) },
+                defaultHeaders = defaultHeaders,
+            )
+            session.prefetchCoordinator = coordinator
+
+            // Coordinator schedules upcoming requests
+            coordinator.scheduleUpcoming()
+
+            // Pre-cache VOD playlists so offline media-source creation succeeds
+            val prefetchDs = cacheDataSourceFactory.createDataSource()
+            CacheWriter(prefetchDs, DataSpec.Builder().setUri(masterUri).setHttpRequestHeaders(defaultHeaders).build(), ByteArray(1024), null).cache()
+            CacheWriter(prefetchDs, DataSpec.Builder().setUri(Uri.parse("$baseUrl/video.m3u8")).setHttpRequestHeaders(defaultHeaders).build(), ByteArray(1024), null).cache()
+            CacheWriter(prefetchDs, DataSpec.Builder().setUri(Uri.parse("$baseUrl/audio.m3u8")).setHttpRequestHeaders(defaultHeaders).build(), ByteArray(1024), null).cache()
+
+            // Execute scheduled video and audio prefetch chunks
+            val scheduled = coordinator.scheduler.registry.values.toList()
+            for (req in scheduled) {
+                val writer = CacheWriter(cacheDataSourceFactory.createDataSource(), req.dataSpec, ByteArray(1024), null)
+                writer.cache()
+                CacheCoverageVerifier.markCompleted(req.identity.cacheKey)
+                coordinator.registerCompletedRequest(req)
+            }
+
+            val hitsBeforeShutdown = serverHitCount.get()
+            assertTrue("HTTP server must have served requests during prefetch", hitsBeforeShutdown > 0)
+
+            // Verify both audio and video chunks are now cached
+            val v0Spec = DataSpec.Builder().setUri(Uri.parse("$baseUrl/video_0.ts")).setHttpRequestHeaders(defaultHeaders).build()
+            val a0Spec = DataSpec.Builder().setUri(Uri.parse("$baseUrl/audio_0.ts")).setHttpRequestHeaders(defaultHeaders).build()
+            assertTrue("Video 0 must be in SimpleCache", simpleCache.isCached(cacheKeyFactory.buildCacheKey(v0Spec), 0L, video0Data.size.toLong()))
+            assertTrue("Audio 0 must be in SimpleCache", simpleCache.isCached(cacheKeyFactory.buildCacheKey(a0Spec), 0L, audio0Data.size.toLong()))
+
+            // Step 2: SHUT DOWN HTTP SERVER COMPLETELY (Internet is completely gone)
+            server.stop(0)
+
+            // Step 3: Media3 ExoPlayer attempts to open master playlist and play media offline
+            val playbackDs = media3RoutingFactory.createDataSource()
+
+            // Read master manifest offline
+            playbackDs.open(DataSpec.Builder().setUri(masterUri).setHttpRequestHeaders(defaultHeaders).build())
+            val masterBytes = ByteArray(masterPlaylist.length)
+            playbackDs.read(masterBytes, 0, masterBytes.size)
+            playbackDs.close()
+            assertEquals(masterPlaylist, String(masterBytes, Charsets.UTF_8))
+
+            // Read video segment offline
+            playbackDs.open(v0Spec)
+            val readV0 = ByteArray(video0Data.size)
+            playbackDs.read(readV0, 0, readV0.size)
+            playbackDs.close()
+            assertArrayEquals("Offline video segment must match prefetched bytes exactly", video0Data, readV0)
+
+            // Read audio segment offline
+            playbackDs.open(a0Spec)
+            val readA0 = ByteArray(audio0Data.size)
+            playbackDs.read(readA0, 0, readA0.size)
+            playbackDs.close()
+            assertArrayEquals("Offline audio segment must match prefetched bytes exactly", audio0Data, readA0)
+
+            // Assert ZERO HTTP requests occurred after server shutdown
+            assertEquals("Zero HTTP upstream requests must occur after network cutoff", hitsBeforeShutdown, serverHitCount.get())
+
+            // Assert that seeking beyond the prefetched range (e.g. video_2.ts which was never prefetched) fails offline
+            val unPrefetchedSpec = DataSpec.Builder().setUri(Uri.parse("$baseUrl/video_2.ts")).setHttpRequestHeaders(defaultHeaders).build()
+            val offlinePlaybackSucceeded = runCatching {
+                val ds = media3RoutingFactory.createDataSource()
+                ds.open(unPrefetchedSpec)
+            }.isSuccess
+            assertFalse("Playback beyond offline endpoint must fail when server is offline", offlinePlaybackSucceeded)
+
+            coordinator.release()
+            session.release()
+        } finally {
+            server.stop(0)
+        }
+    }
 }

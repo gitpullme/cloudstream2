@@ -40,8 +40,11 @@ object PlaybackCacheManager {
     private const val MAX_AUTO_CACHE_BYTES = 2L * 1024L * 1024L * 1024L
 
     private val lock = Any()
+    @Volatile
     private var cache: SimpleCache? = null
+    @Volatile
     private var evictor: PlaybackAwareCacheEvictor? = null
+    @Volatile
     private var configuredBytes: Long = 0L
     private var configuredRequestBytes: Long = -1L
 
@@ -237,6 +240,11 @@ object PlaybackCacheManager {
         if (session != null && session.isLive) return true
         if (bypassActiveSource) return true
         if (isSourceLive(uri.toString())) return true
+        if (session?.prefetchModeEnabled == true && session.isLive != true) {
+            // In Prefetch Mode for VOD presentations, allow caching of static playlists and master manifests
+            // so playback succeeds seamlessly offline without network access.
+            return false
+        }
         return isManifest(uri)
     }
 
@@ -296,32 +304,68 @@ object PlaybackCacheManager {
     /**
      * Safely reclaims storage from low-value media (older sessions or segments behind the
      * playback retention window) to make room for upcoming prefetch downloads.
+     * Accepts incoming request size and all outstanding worker reservations to prevent collective oversubscription.
+     */
+    fun ensureRoomForPrefetch(
+        session: PlaybackSessionState,
+        incomingBytes: Long,
+        reservedBytes: Long = 0L,
+        snapshot: PlaybackPlayerSnapshot? = null,
+    ): ReclamationResult {
+        val limit = if (session.prefetchLimitBytes > 0L) session.prefetchLimitBytes else configuredBytes
+        if (limit <= 0L) {
+            return ReclamationResult(0L, true, "No limit configured")
+        }
+
+        val c = cache
+        val ev = evictor
+        if (c == null || ev == null) {
+            // Standalone or test cache without global manager initialization
+            val currentUsage = usageBytes()
+            val totalRequired = currentUsage + reservedBytes + incomingBytes
+            val success = totalRequired <= limit
+            return ReclamationResult(
+                bytesReclaimed = 0L,
+                success = success,
+                reason = if (!success) "Storage limit reached ($totalRequired > $limit)" else null,
+            )
+        }
+
+        val currentUsage = ev.usageBytes()
+        val totalRequired = currentUsage + reservedBytes + incomingBytes
+        val requiredReclamation = maxOf(0L, totalRequired - limit)
+
+        if (requiredReclamation == 0L) {
+            return ReclamationResult(0L, true, "Already sufficient room")
+        }
+
+        // Two-phase eviction: reclaimBytes selects victim under evictor lock and invokes SimpleCache.removeSpan OUTSIDE the lock
+        val freed = ev.reclaimBytes(c, requiredReclamation)
+        val resultingUsage = ev.usageBytes()
+        val success = (resultingUsage + reservedBytes + incomingBytes <= limit)
+
+        Log.d(
+            TAG,
+            "ensureRoomForPrefetch: incoming=${incomingBytes / 1024}KB, reserved=${reservedBytes / 1024}KB, " +
+                "reclaimTarget=${requiredReclamation / 1024}KB, freed=${freed / 1024}KB, success=$success"
+        )
+
+        return ReclamationResult(
+            bytesReclaimed = freed,
+            success = success,
+            reason = if (!success) "Insufficient reclaimable space (freed $freed of $requiredReclamation needed)" else null,
+        )
+    }
+
+    /**
+     * Backward-compatible bridge delegating to ensureRoomForPrefetch.
      */
     fun makeRoomForPrefetch(
         session: PlaybackSessionState,
         requiredBytes: Long,
         snapshot: PlaybackPlayerSnapshot?,
     ): ReclamationResult {
-        synchronized(lock) {
-            val c = cache ?: return ReclamationResult(0L, false, "Cache not initialized")
-            val ev = evictor ?: return ReclamationResult(0L, false, "Evictor not initialized")
-
-            val limit = if (session.prefetchLimitBytes > 0L) session.prefetchLimitBytes else configuredBytes
-            val currentUsage = ev.usageBytes()
-            if (currentUsage + requiredBytes <= limit) {
-                return ReclamationResult(0L, true, "Already sufficient room")
-            }
-
-            val targetReclaimBytes = (currentUsage + requiredBytes) - limit
-            val freed = ev.reclaimBytes(c, targetReclaimBytes)
-            val success = (ev.usageBytes() + requiredBytes <= limit)
-            Log.d(TAG, "makeRoomForPrefetch: required=${requiredBytes / 1024}KB, freed=${freed / 1024}KB, success=$success")
-            return ReclamationResult(
-                bytesReclaimed = freed,
-                success = success,
-                reason = if (!success) "Insufficient reclaimable space" else null,
-            )
-        }
+        return ensureRoomForPrefetch(session, requiredBytes, 0L, snapshot)
     }
 
     /**

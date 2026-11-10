@@ -40,6 +40,28 @@ class Mp4RangePrefetchAdapter(
 
     override val name: String = "Progressive MP4 (Range)"
 
+    var adapterState: AdapterState = AdapterState.UNRESOLVED
+        private set
+
+    override val state: AdapterState
+        get() = adapterState
+
+    override suspend fun checkReadiness(snapshot: PlaybackPlayerSnapshot): AdapterState {
+        if (adapterState == AdapterState.RELEASED) return AdapterState.RELEASED
+        if (adapterState == AdapterState.FAILED_RETRYABLE) {
+            val ok = runCatching { verifyRangeAndIndexSupport() }.getOrDefault(false)
+            if (ok) {
+                adapterState = AdapterState.READY
+            }
+        }
+        return adapterState
+    }
+
+    override fun release() {
+        adapterState = AdapterState.RELEASED
+        parsedSegments.clear()
+    }
+
     companion object {
         private const val TAG = "Mp4RangePrefetch"
         const val DEFAULT_CHUNK_SIZE = 1024L * 1024L // 1 MB chunk target
@@ -92,10 +114,20 @@ class Mp4RangePrefetchAdapter(
         }
 
         if (!isMp4Mime && !isMp4Ext) {
+            adapterState = AdapterState.UNSUPPORTED
             return false
         }
 
-        return verifyRangeAndIndexSupport()
+        val ok = try {
+            verifyRangeAndIndexSupport()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Temporary failure verifying range support for $sourceUri: ${e.message}")
+            adapterState = AdapterState.FAILED_RETRYABLE
+            return true
+        }
+
+        adapterState = if (ok) AdapterState.READY else AdapterState.UNSUPPORTED
+        return ok
     }
 
     private suspend fun readByteRange(offset: Long, length: Long): ByteArray? = withContext(Dispatchers.IO) {
@@ -585,6 +617,18 @@ class Mp4RangePrefetchAdapter(
         val requests = mutableListOf<PrefetchRequest>()
         var scheduledBytes = 0L
 
+        val initKey = if (initHeaderEnd > 0L) {
+            val s = DataSpec.Builder().setUri(sourceUri).setPosition(0L).setLength(initHeaderEnd).setHttpRequestHeaders(defaultHeaders).build()
+            PrefetchRequestIdentity.fromDataSpec(s, cacheKeyFactory, defaultHeaders).cacheKey
+        } else null
+
+        val tailKey = if (tailMoovOffset > 0L && tailMoovLength > 0L) {
+            val s = DataSpec.Builder().setUri(sourceUri).setPosition(tailMoovOffset).setLength(tailMoovLength).setHttpRequestHeaders(defaultHeaders).build()
+            PrefetchRequestIdentity.fromDataSpec(s, cacheKeyFactory, defaultHeaders).cacheKey
+        } else null
+
+        val initDeps = listOfNotNull(initKey, tailKey)
+
         // 1. Initialization Segment: Progressive container header (ftyp + moov)
         if (prefetchStartUs == 0L && initHeaderEnd > 0L) {
             val initSpec = DataSpec.Builder()
@@ -662,6 +706,7 @@ class Mp4RangePrefetchAdapter(
                     isInit = false,
                     trackType = C.TRACK_TYPE_VIDEO,
                     dataSpec = spec,
+                    dependencyKeys = initDeps,
                 )
             }
         }

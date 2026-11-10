@@ -55,6 +55,7 @@ class PrefetchRequestScheduler(
         const val INITIAL_WORKERS = 1
         const val MAX_WORKERS = 4
         const val MIN_WORKERS = 1
+        const val MAX_QUEUE_DEPTH = 50
         const val MIN_DISK_RESERVE_BYTES = 50L * 1024L * 1024L // 50 MB safety margin
         const val BUFFER_SIZE = 32 * 1024 // 32 KB chunk
         const val MAX_RETRIES = 2
@@ -64,6 +65,7 @@ class PrefetchRequestScheduler(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Any()
+    private val reservationLock = Any()
     private val priorityQueue = PriorityQueue<PrefetchRequest>()
 
     // Registry of all active requests
@@ -153,6 +155,12 @@ class PrefetchRequestScheduler(
                     }
                 }
                 return existing
+            }
+
+            if (priorityQueue.size >= MAX_QUEUE_DEPTH) {
+                if (request.priority.rank >= PrefetchRequest.Priority.USEFUL_PREFETCH.rank) {
+                    return request
+                }
             }
 
             request.status = PrefetchRequest.Status.QUEUED
@@ -273,8 +281,8 @@ class PrefetchRequestScheduler(
                     continue
                 }
 
-                // Check if storage capacity or disk space is full
-                if (!hasAvailableStorage(request)) {
+                // Atomically check storage capacity and claim worker reservation
+                if (!tryAdmitAndReserve(request)) {
                     synchronized(lock) {
                         if (!request.isTerminal()) {
                             priorityQueue.offer(request)
@@ -295,23 +303,23 @@ class PrefetchRequestScheduler(
     }
 
     private suspend fun executeRequest(request: PrefetchRequest) {
+        val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
         val cache = getCache()
         val factory = getCacheDataSourceFactory()
         if (cache == null || factory == null) {
+            reservedBytes.updateAndGet { cur -> maxOf(0L, cur - estimatedBytes) }
             request.status = PrefetchRequest.Status.FAILED
             return
         }
 
         // Verify if already cached
         if (CacheCoverageVerifier.isFullyCached(cache, request.identity.cacheKey, request.identity.position, request.identity.length)) {
+            reservedBytes.updateAndGet { cur -> maxOf(0L, cur - estimatedBytes) }
             cacheHitCount.incrementAndGet()
             request.status = PrefetchRequest.Status.COMPLETED
             session.prefetchCoordinator?.registerCompletedRequest(request)
             return
         }
-
-        val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
-        reservedBytes.addAndGet(estimatedBytes)
 
         cacheMissCount.incrementAndGet()
         request.status = PrefetchRequest.Status.RUNNING
@@ -370,7 +378,7 @@ class PrefetchRequestScheduler(
             activeWorkerLatches.remove(request.id)
             latch.countDown()
 
-            reservedBytes.addAndGet(-estimatedBytes)
+            reservedBytes.updateAndGet { cur -> maxOf(0L, cur - estimatedBytes) }
             activeWorkerCount.decrementAndGet()
             session.releaseLease(lease)
             runCatching { cacheDataSource.close() }
@@ -378,9 +386,10 @@ class PrefetchRequestScheduler(
     }
 
     /**
-     * Storage-limit check: Ensures background prefetch NEVER bypasses the configured limit.
+     * Atomically validates available storage headroom and claims worker reservation under reservationLock.
+     * Prevents collective oversubscription across parallel workers.
      */
-    fun hasAvailableStorage(request: PrefetchRequest): Boolean {
+    fun tryAdmitAndReserve(request: PrefetchRequest): Boolean {
         // 1. Guard device filesystem free space
         val freeDisk = runCatching {
             StatFs(context.cacheDir.absolutePath).availableBytes
@@ -391,37 +400,48 @@ class PrefetchRequestScheduler(
             return false
         }
 
-        // 2. Guard PlaybackCacheManager limit
-        val currentUsage = PlaybackCacheManager.usageBytes()
-        val limit = if (session.prefetchLimitBytes > 0L) {
-            session.prefetchLimitBytes
-        } else {
-            PlaybackCacheManager.maxBytes()
-        }
-
         val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
-        val totalUsedAndReserved = currentUsage + reservedBytes.get()
 
-        if (limit > 0L && totalUsedAndReserved + estimatedBytes > limit) {
-            // Attempt proactive reclamation of obsolete spans (outside 30s retention window)
-            val neededReclamation = (totalUsedAndReserved + estimatedBytes) - limit
-            PlaybackCacheManager.makeRoomForPrefetch(
+        synchronized(reservationLock) {
+            val currentReserved = reservedBytes.get()
+            val result = PlaybackCacheManager.ensureRoomForPrefetch(
                 session = session,
-                requiredBytes = neededReclamation,
+                incomingBytes = estimatedBytes,
+                reservedBytes = currentReserved,
                 snapshot = session.prefetchCoordinator?.latestSnapshot,
             )
 
-            val updatedUsageAndReserved = PlaybackCacheManager.usageBytes() + reservedBytes.get()
-            if (updatedUsageAndReserved + estimatedBytes > limit) {
-                // ONLY genuine Media3 playback requests may proceed when at or over the budget
+            if (!result.success) {
                 val isMedia3Playback = request.priority == PrefetchRequest.Priority.IMMEDIATE &&
                     media3ActiveRequests.contains(request.identity)
-
-                // Background prefetch is blocked until playback advances or cache is cleared
-                return isMedia3Playback
+                if (!isMedia3Playback) {
+                    return false
+                }
             }
-        }
 
+            reservedBytes.addAndGet(estimatedBytes)
+            return true
+        }
+    }
+
+    /**
+     * Storage-limit check: Ensures background prefetch NEVER bypasses the configured limit.
+     */
+    fun hasAvailableStorage(request: PrefetchRequest): Boolean {
+        val freeDisk = runCatching {
+            StatFs(context.cacheDir.absolutePath).availableBytes
+        }.getOrDefault(Long.MAX_VALUE)
+        if (freeDisk < MIN_DISK_RESERVE_BYTES) return false
+
+        val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
+        val limit = if (session.prefetchLimitBytes > 0L) session.prefetchLimitBytes else PlaybackCacheManager.maxBytes()
+        if (limit <= 0L) return true
+        val current = PlaybackCacheManager.usageBytes() + reservedBytes.get()
+        if (current + estimatedBytes > limit) {
+            val isMedia3Playback = request.priority == PrefetchRequest.Priority.IMMEDIATE &&
+                media3ActiveRequests.contains(request.identity)
+            return isMedia3Playback
+        }
         return true
     }
 

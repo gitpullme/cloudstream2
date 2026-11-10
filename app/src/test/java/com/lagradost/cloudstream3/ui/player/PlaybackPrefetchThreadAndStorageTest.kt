@@ -256,26 +256,31 @@ class PlaybackPrefetchThreadAndStorageTest {
             mkdirs()
         }
         val cache = SimpleCache(tempDir, NoOpCacheEvictor())
+        CacheCoverageVerifier.clear()
         try {
             val key = "unknown_len_segment"
             val uri = Uri.parse("https://cdn.example.com/stream/unknown_seg.ts")
 
-            // Simulate upstream that serves 1 byte
+            val payload = byteArrayOf(0x42)
             val cacheDataSourceFactory = CacheDataSource.Factory().apply {
                 setCache(cache)
                 setUpstreamDataSourceFactory {
                     object : DataSource {
-                        private var read = false
+                        private var stream: java.io.ByteArrayInputStream? = null
                         override fun addTransferListener(transferListener: TransferListener) = Unit
-                        override fun open(dataSpec: DataSpec): Long = 100L // Advertised length 100
+                        override fun open(dataSpec: DataSpec): Long {
+                            val len = if (dataSpec.length != -1L) dataSpec.length.toInt() else payload.size
+                            stream = java.io.ByteArrayInputStream(payload, 0, len)
+                            return len.toLong()
+                        }
                         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-                            if (read) return -1
-                            buffer[offset] = 0x42
-                            read = true
-                            return 1 // Only 1 byte read so far
+                            return stream?.read(buffer, offset, length) ?: -1
                         }
                         override fun getUri(): Uri = uri
-                        override fun close() = Unit
+                        override fun close() {
+                            stream?.close()
+                            stream = null
+                        }
                     }
                 }
                 setCacheKeyFactory { key }
@@ -306,9 +311,157 @@ class PlaybackPrefetchThreadAndStorageTest {
                 CacheCoverageVerifier.isFullyCached(cache, key, 0L, -1L)
             )
         } finally {
+            CacheCoverageVerifier.clear()
             runCatching { cache.release() }
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `HLS adapter readiness transitions from WAITING_FOR_MANIFEST to READY when manifest becomes available`() = runBlocking {
+        val hlsUri = Uri.parse("https://cdn.example.com/hls/master.m3u8")
+        val session = PlaybackSessionState(
+            sourceUri = hlsUri.toString(),
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 50L * 1024L * 1024L,
+        )
+
+        var playerManifest: Any? = null
+        val dummyPlayer = createThreadCheckingPlayer(
+            manifest = null,
+            currentPos = 0L,
+            bufferedPos = 0L,
+        )
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = {
+                // Return dynamic player returning playerManifest
+                Proxy.newProxyInstance(
+                    Player::class.java.classLoader,
+                    arrayOf(Player::class.java),
+                ) { _, method, _ ->
+                    when (method.name) {
+                        "getApplicationLooper" -> Looper.getMainLooper()
+                        "getCurrentPosition" -> 0L
+                        "getBufferedPosition" -> 0L
+                        "getDuration" -> 60_000L
+                        "getPlaybackState" -> Player.STATE_READY
+                        "isPlaying" -> true
+                        "getPlayWhenReady" -> true
+                        "getCurrentManifest" -> playerManifest
+                        "getCurrentTracks" -> null
+                        else -> null
+                    }
+                } as Player
+            },
+            getCache = { null },
+            getCacheDataSourceFactory = { null },
+            upstreamFactory = { throw UnsupportedOperationException() },
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // Cycle 1: First snapshot has currentManifest = null
+        coordinator.scheduleUpcoming()
+
+        val adapter = coordinator.activeAdapter
+        assertNotNull("HLS adapter should be recognized by URL extension", adapter)
+        assertEquals("Adapter state should be WAITING_FOR_MANIFEST on initial snapshot", AdapterState.WAITING_FOR_MANIFEST, adapter?.state)
+        assertEquals("No requests should be queued while waiting for manifest", 0, coordinator.scheduler.getQueueDepth())
+
+        // Cycle 2: Manifest arrives on player
+        val mediaPlaylist = HlsPlaylistParser().parse(
+            hlsUri,
+            """
+            #EXTM3U
+            #EXT-X-VERSION:4
+            #EXT-X-TARGETDURATION:6
+            #EXT-X-MEDIA-SEQUENCE:0
+            #EXT-X-PLAYLIST-TYPE:VOD
+            #EXTINF:6.0,
+            seg0.ts
+            #EXTINF:6.0,
+            seg1.ts
+            #EXT-X-ENDLIST
+            """.trimIndent().byteInputStream()
+        )
+        playerManifest = mediaPlaylist
+
+        // Coordinator runs next cycle without recreating player or coordinator
+        coordinator.scheduleUpcoming()
+
+        assertEquals("Adapter state should transition to READY after manifest arrives", AdapterState.READY, adapter?.state)
+        assertTrue(
+            "Requests should be scheduled once manifest is available",
+            coordinator.scheduler.getQueueDepth() > 0 || coordinator.scheduler.registry.isNotEmpty()
+        )
+
+        coordinator.release()
+        session.release()
+    }
+
+    @Test
+    fun `DASH adapter readiness transitions from WAITING_FOR_MANIFEST to READY when manifest becomes available`() = runBlocking {
+        val dashUri = Uri.parse("https://cdn.example.com/dash/manifest.mpd")
+        val session = PlaybackSessionState(
+            sourceUri = dashUri.toString(),
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 50L * 1024L * 1024L,
+        )
+
+        var playerManifest: Any? = null
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = {
+                Proxy.newProxyInstance(
+                    Player::class.java.classLoader,
+                    arrayOf(Player::class.java),
+                ) { _, method, _ ->
+                    when (method.name) {
+                        "getApplicationLooper" -> Looper.getMainLooper()
+                        "getCurrentPosition" -> 0L
+                        "getBufferedPosition" -> 0L
+                        "getDuration" -> 60_000L
+                        "getPlaybackState" -> Player.STATE_READY
+                        "isPlaying" -> true
+                        "getPlayWhenReady" -> true
+                        "getCurrentManifest" -> playerManifest
+                        "getCurrentTracks" -> null
+                        else -> null
+                    }
+                } as Player
+            },
+            getCache = { null },
+            getCacheDataSourceFactory = { null },
+            upstreamFactory = { throw UnsupportedOperationException() },
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // Cycle 1: First snapshot has currentManifest = null
+        coordinator.scheduleUpcoming()
+
+        val adapter = coordinator.activeAdapter
+        assertNotNull("DASH adapter should be recognized by URL extension", adapter)
+        assertEquals("Adapter state should be WAITING_FOR_MANIFEST on initial snapshot", AdapterState.WAITING_FOR_MANIFEST, adapter?.state)
+        assertEquals("No requests should be queued while waiting for manifest", 0, coordinator.scheduler.getQueueDepth())
+
+        // Cycle 2: Manifest arrives
+        val dashManifest = androidx.media3.exoplayer.dash.manifest.DashManifest(
+            0L, 60_000L, 0L, false, 0L, 0L, 0L, 0L, null, null, null, null, emptyList()
+        )
+        playerManifest = dashManifest
+
+        coordinator.scheduleUpcoming()
+
+        assertEquals("DASH adapter state should transition to READY after manifest arrives", AdapterState.READY, adapter?.state)
+
+        coordinator.release()
+        session.release()
     }
 
     @Test

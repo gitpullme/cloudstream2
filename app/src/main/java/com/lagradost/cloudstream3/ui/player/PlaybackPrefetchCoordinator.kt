@@ -7,12 +7,13 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.cache.Cache
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,23 +27,25 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Session-scoped coordinator that inspects player state through immutable snapshots
- * and schedules upcoming media downloads using bounded parallel workers and persistent cache.
+ * Central coordinator for Prefetch Mode.
  *
- * Thread Safety:
- * - All ExoPlayer state is read via PlaybackPlayerSnapshot on the player application looper.
- * - All adapter resolution, request scheduling, and network logic run on Dispatchers.IO.
+ * Coordinates:
+ * - Thread confinement: captures immutable Player snapshots on ExoPlayer's looper.
+ * - Dynamic format adapter resolution (HLS, DASH, MP4) with explicit lifecycle states.
+ * - Usable storage-budget calculation with strict limit enforcement and atomic reservations.
+ * - Per-interval dependency tracking (init segments, AES-128 keys) without global seekbar freeze.
+ * - High-precision verified offline playability coverage calculation.
  */
 @OptIn(UnstableApi::class)
 class PlaybackPrefetchCoordinator(
     val context: Context,
     val session: PlaybackSessionState,
-    val playerProvider: () -> androidx.media3.common.Player?,
+    val playerProvider: () -> Player?,
     val getCache: () -> SimpleCache?,
     val getCacheDataSourceFactory: () -> CacheDataSource.Factory?,
-    val upstreamFactory: DataSource.Factory,
+    val upstreamFactory: DataSource.Factory? = null,
+    val cacheKeyFactory: (DataSpec) -> String = { it.key ?: it.uri.toString() },
     val defaultHeaders: Map<String, String> = emptyMap(),
-    val cacheKeyFactory: (DataSpec) -> String,
     val clock: () -> Long = { SystemClock.elapsedRealtime() },
 ) {
     companion object {
@@ -50,6 +53,7 @@ class PlaybackPrefetchCoordinator(
         const val LOOP_INTERVAL_MS = 1_500L
         const val DIAGNOSTICS_INTERVAL_MS = 10_000L
         const val CONTIGUOUS_GAP_TOLERANCE_US = 500_000L // 500ms segment timestamp jitter
+        const val WATCHDOG_TIMEOUT_MS = 30_000L
     }
 
     data class PrefetchCoverageRange(
@@ -59,6 +63,7 @@ class PlaybackPrefetchCoordinator(
         val byteOffset: Long = 0L,
         val byteLength: Long = -1L,
         val trackType: Int = C.TRACK_TYPE_VIDEO,
+        val dependencyKeys: List<String> = emptyList(),
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -81,6 +86,8 @@ class PlaybackPrefetchCoordinator(
     internal var activeAdapter: PrefetchAdapter? = null
     private var selectedAdapterName = "None"
     private var lastDiagnosticLogTimeMs = 0L
+    private var lastProgressTimeMs = clock()
+    private var lastSourceUri: Uri? = null
 
     // Completed coverage ranges verified in cache
     private val completedRanges = ConcurrentHashMap.newKeySet<PrefetchCoverageRange>()
@@ -104,11 +111,10 @@ class PlaybackPrefetchCoordinator(
     }
 
     fun onSeek(newPositionUs: Long) {
-        if (!started.get() || isReleased.get()) return
+        if (isReleased.get()) return
         scope.launch {
             scheduler.onSeek(newPositionUs)
             activeAdapter?.onSeek(newPositionUs)
-            // Recompute coverage immediately around new seek point
             updateCoverage(newPositionUs, newPositionUs)
             scheduleUpcoming()
         }
@@ -119,6 +125,7 @@ class PlaybackPrefetchCoordinator(
             try {
                 scheduler.ensureWorkerPool()
                 scheduleUpcoming()
+                checkWatchdog()
             } catch (t: Throwable) {
                 Log.w(TAG, "error in prefetch cycle: ${t.message}")
             }
@@ -126,7 +133,18 @@ class PlaybackPrefetchCoordinator(
         }
     }
 
-    private suspend fun scheduleUpcoming() {
+    private fun checkWatchdog() {
+        val now = clock()
+        if (scheduler.getQueueDepth() > 0 && scheduler.getActiveWorkerCount() == 0) {
+            if (now - lastProgressTimeMs > WATCHDOG_TIMEOUT_MS) {
+                Log.w(TAG, "Prefetch watchdog: worker pool stalled with queue depth ${scheduler.getQueueDepth()}; reviving workers")
+                scheduler.ensureWorkerPool()
+                lastProgressTimeMs = now
+            }
+        }
+    }
+
+    internal suspend fun scheduleUpcoming() {
         val uriStr = session.sourceUri ?: return
         val parsedUri = Uri.parse(uriStr)
 
@@ -141,6 +159,17 @@ class PlaybackPrefetchCoordinator(
         latestSnapshot = snapshot
         if (snapshot.isEnded) return
 
+        // Check for stream / media item transition
+        if (lastSourceUri != null && lastSourceUri != snapshot.sourceUri) {
+            Log.i(TAG, "Stream change detected: $lastSourceUri -> ${snapshot.sourceUri}; resetting coordinator state")
+            activeAdapter?.release()
+            activeAdapter = null
+            completedRanges.clear()
+            scheduler.onSeek(0L)
+            lastReportedCoverageMs = -1L
+        }
+        lastSourceUri = snapshot.sourceUri
+
         // 2. Resolve adapter if not yet initialized
         var adapter = activeAdapter
         if (adapter == null) {
@@ -150,10 +179,22 @@ class PlaybackPrefetchCoordinator(
 
         if (adapter == null) return
 
+        // Advance adapter readiness state (e.g. from WAITING_FOR_MANIFEST -> READY)
+        val currentState = adapter.checkReadiness(snapshot)
+        if (currentState != AdapterState.READY) {
+            maybeLogDiagnostics(snapshot, 0L, reasonStopped = "Adapter waiting: $currentState")
+            return
+        }
+
         // 3. Compute dynamic usable prefetch budget
         val availableBudgetBytes = computeAvailablePrefetchBudget()
         if (availableBudgetBytes <= 0L) {
-            PlaybackCacheManager.makeRoomForPrefetch(session, 1024 * 1024L, snapshot)
+            PlaybackCacheManager.ensureRoomForPrefetch(
+                session = session,
+                incomingBytes = 1024 * 1024L,
+                reservedBytes = scheduler.reservedBytes.get(),
+                snapshot = snapshot,
+            )
             refreshCompletedCoverage(snapshot)
             maybeLogDiagnostics(snapshot, availableBudgetBytes, reasonStopped = "Storage/Cache limit reached")
             return
@@ -183,7 +224,7 @@ class PlaybackPrefetchCoordinator(
         )
         if (hlsAdapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = hlsAdapter.name
-            Log.i(TAG, "Selected HLS prefetch adapter for $uri")
+            Log.i(TAG, "Selected HLS prefetch adapter for $uri (state=${hlsAdapter.state})")
             return hlsAdapter
         }
 
@@ -193,23 +234,23 @@ class PlaybackPrefetchCoordinator(
         )
         if (dashAdapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = dashAdapter.name
-            Log.i(TAG, "Selected DASH prefetch adapter for $uri")
+            Log.i(TAG, "Selected DASH prefetch adapter for $uri (state=${dashAdapter.state})")
             return dashAdapter
         }
 
         val mp4Adapter = Mp4RangePrefetchAdapter(
             sourceUri = uri,
-            upstreamFactory = upstreamFactory,
+            upstreamFactory = upstreamFactory ?: return null,
             defaultHeaders = defaultHeaders,
             cacheKeyFactory = cacheKeyFactory,
         )
         if (mp4Adapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = mp4Adapter.name
-            Log.i(TAG, "Selected progressive MP4 prefetch adapter for $uri")
+            Log.i(TAG, "Selected progressive MP4 prefetch adapter for $uri (state=${mp4Adapter.state})")
             return mp4Adapter
         }
 
-        // If format is not ready (e.g. manifest not loaded yet), do not permanently disable
+        // If manifest not loaded yet on first snapshot for HLS/DASH, do not permanently disable
         if (manifest == null && (uri.path?.endsWith(".m3u8") == true || uri.path?.endsWith(".mpd") == true)) {
             return null
         }
@@ -236,8 +277,12 @@ class PlaybackPrefetchCoordinator(
 
         val freeDisk = runCatching {
             StatFs(context.cacheDir.absolutePath).availableBytes
-        }.getOrDefault(0L)
-        val freeDiskUsable = maxOf(0L, freeDisk - PrefetchRequestScheduler.MIN_DISK_RESERVE_BYTES)
+        }.getOrNull()
+        val freeDiskUsable = if (freeDisk != null) {
+            maxOf(0L, freeDisk - PrefetchRequestScheduler.MIN_DISK_RESERVE_BYTES)
+        } else {
+            Long.MAX_VALUE
+        }
 
         val cacheHeadroom = if (limitBytes > 0L) {
             maxOf(0L, (limitBytes - currentUsage) + reclaimable - reserved)
@@ -251,6 +296,7 @@ class PlaybackPrefetchCoordinator(
      * Registers a completed prefetch request to immediately extend coverage if verified.
      */
     fun registerCompletedRequest(request: PrefetchRequest) {
+        lastProgressTimeMs = clock()
         if (!request.isInit && request.durationUs > 0L) {
             completedRanges += PrefetchCoverageRange(
                 mediaTimeStartUs = request.mediaTimeUs,
@@ -259,6 +305,7 @@ class PlaybackPrefetchCoordinator(
                 byteOffset = request.identity.position,
                 byteLength = request.identity.length,
                 trackType = request.trackType,
+                dependencyKeys = request.dependencyKeys,
             )
             latestSnapshot?.let { snapshot ->
                 updateCoverage(snapshot)
@@ -284,6 +331,7 @@ class PlaybackPrefetchCoordinator(
                         byteOffset = identity.position,
                         byteLength = identity.length,
                         trackType = request.trackType,
+                        dependencyKeys = request.dependencyKeys,
                     )
                 }
             }
@@ -297,8 +345,21 @@ class PlaybackPrefetchCoordinator(
         updateCoverage(snapshot)
     }
 
-    private fun computeContiguousSpanEnd(ranges: List<PrefetchCoverageRange>, playheadUs: Long): Long {
-        val sorted = ranges
+    private fun computeContiguousSpanEnd(
+        cache: Cache?,
+        ranges: List<PrefetchCoverageRange>,
+        playheadUs: Long,
+    ): Long {
+        if (cache == null) return playheadUs
+
+        // Filter ranges that have ALL per-interval dependencies (init segment, AES key) fully verified
+        val validRanges = ranges.filter { range ->
+            range.dependencyKeys.isEmpty() || range.dependencyKeys.all { depKey ->
+                CacheCoverageVerifier.isFullyCached(cache, depKey, 0L, -1L)
+            }
+        }
+
+        val sorted = validRanges
             .filter { it.mediaTimeEndUs >= playheadUs }
             .sortedBy { it.mediaTimeStartUs }
 
@@ -321,26 +382,15 @@ class PlaybackPrefetchCoordinator(
         val cache = getCache()
         val playheadUs = maxOf(currentPositionUs, bufferedPositionUs)
 
-        // 1. Verify all scheduled initialization chunks and encryption keys are fully cached
-        val initRequests = scheduler.registry.values.filter { it.isInit }
-        val isInitVerified = cache != null && (initRequests.isEmpty() || initRequests.all { req ->
-            CacheCoverageVerifier.isFullyCached(cache, req.identity.cacheKey, req.identity.position, req.identity.length)
-        })
-
-        if (!isInitVerified && initRequests.isNotEmpty()) {
-            notifyCoverageChanged(playheadUs / 1000L)
-            return
-        }
-
-        // 2. Separate verified ranges by track
+        // Separate verified ranges by track
         val videoRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_VIDEO }
         val audioRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_AUDIO }
 
-        val contiguousVideoEndUs = computeContiguousSpanEnd(videoRanges, playheadUs)
+        val contiguousVideoEndUs = computeContiguousSpanEnd(cache, videoRanges, playheadUs)
         val hasSeparateAudio = activeAdapter?.hasSeparateAudioTrack() == true
 
         val offlinePlayableUs = if (hasSeparateAudio) {
-            val contiguousAudioEndUs = computeContiguousSpanEnd(audioRanges, playheadUs)
+            val contiguousAudioEndUs = computeContiguousSpanEnd(cache, audioRanges, playheadUs)
             minOf(contiguousVideoEndUs, contiguousAudioEndUs)
         } else {
             contiguousVideoEndUs
@@ -396,13 +446,17 @@ class PlaybackPrefetchCoordinator(
             "${parsed.scheme}://${parsed.host}${parsed.path}"
         } ?: "none"
 
+        val adapterStateStr = activeAdapter?.state?.name ?: "NONE"
+
         Log.d(
             TAG,
             "Diagnostics: [PrefetchMode=${session.prefetchModeEnabled}] " +
-                "Adapter=$selectedAdapterName " +
+                "Session=${session.sessionId} " +
+                "Adapter=$selectedAdapterName(State=$adapterStateStr) " +
                 "Source=$safeUri " +
                 "Cache=${PlaybackCacheManager.usageBytes() / (1024 * 1024)}MB / " +
                 "Limit=${session.prefetchLimitBytes / (1024 * 1024)}MB " +
+                "Reserved=${scheduler.reservedBytes.get() / (1024 * 1024)}MB " +
                 "Reclaimable=${PlaybackCacheManager.reclaimableBytes(session, snapshot) / (1024 * 1024)}MB " +
                 "AvailableBudget=${availableBudgetBytes / (1024 * 1024)}MB " +
                 "FreeDisk=${freeDisk / (1024 * 1024)}MB " +

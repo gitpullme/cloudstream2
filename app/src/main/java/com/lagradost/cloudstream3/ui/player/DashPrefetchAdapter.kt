@@ -22,6 +22,12 @@ class DashPrefetchAdapter(
 
     override val name: String = "DASH"
 
+    var adapterState: AdapterState = AdapterState.UNRESOLVED
+        private set
+
+    override val state: AdapterState
+        get() = adapterState
+
     private var hasSeparateAudio: Boolean = false
     override fun hasSeparateAudioTrack(): Boolean = hasSeparateAudio
 
@@ -31,10 +37,28 @@ class DashPrefetchAdapter(
     }
 
     override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
-        if (manifest is DashManifest) return true
-        if (mimeType == MimeTypes.APPLICATION_MPD) return true
-        val path = sourceUri.path?.lowercase() ?: return false
-        return path.endsWith(".mpd") || path.contains(".mpd")
+        val matchesMime = mimeType == MimeTypes.APPLICATION_MPD
+        val path = sourceUri.path?.lowercase() ?: ""
+        val matchesExt = path.endsWith(".mpd") || path.contains(".mpd")
+        val hasManifest = manifest is DashManifest
+
+        if (hasManifest || matchesMime || matchesExt) {
+            adapterState = if (hasManifest) AdapterState.READY else AdapterState.WAITING_FOR_MANIFEST
+            return true
+        }
+        adapterState = AdapterState.UNSUPPORTED
+        return false
+    }
+
+    override suspend fun checkReadiness(snapshot: PlaybackPlayerSnapshot): AdapterState {
+        if (adapterState == AdapterState.RELEASED) return AdapterState.RELEASED
+        val manifest = snapshot.currentManifest
+        if (manifest is DashManifest) {
+            adapterState = AdapterState.READY
+        } else if (adapterState != AdapterState.READY) {
+            adapterState = AdapterState.WAITING_FOR_MANIFEST
+        }
+        return adapterState
     }
 
     override suspend fun getUpcomingRequests(
@@ -73,6 +97,7 @@ class DashPrefetchAdapter(
                 val baseUri = representation.baseUrls.firstOrNull()?.url ?: ""
 
                 // 1. Initialization Segment
+                var initCacheKey: String? = null
                 representation.initializationUri?.let { initRangedUri ->
                     val initUri = initRangedUri.resolveUri(baseUri)
                     val initLength = if (initRangedUri.length > 0) initRangedUri.length else C.LENGTH_UNSET.toLong()
@@ -87,6 +112,7 @@ class DashPrefetchAdapter(
                     if (scheduledBytes + initBytes <= availableBudgetBytes) {
                         scheduledBytes += initBytes
                         val identity = PrefetchRequestIdentity.fromDataSpec(initSpec, cacheKeyFactory, defaultHeaders)
+                        initCacheKey = identity.cacheKey
                         requests += PrefetchRequest(
                             identity = identity,
                             priority = PrefetchRequest.Priority.IMMEDIATE,
@@ -155,6 +181,7 @@ class DashPrefetchAdapter(
                                     isInit = false,
                                     trackType = adaptationSet.type,
                                     dataSpec = spec,
+                                    dependencyKeys = listOfNotNull(initCacheKey),
                                 )
 
                                 if (isDynamic) {
@@ -179,5 +206,9 @@ class DashPrefetchAdapter(
             if (matched != null) return matched
         }
         return adaptationSet.representations.firstOrNull()
+    }
+
+    override fun release() {
+        adapterState = AdapterState.RELEASED
     }
 }

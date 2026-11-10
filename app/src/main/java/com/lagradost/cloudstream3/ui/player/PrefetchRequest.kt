@@ -17,6 +17,7 @@ data class PrefetchRequest(
     val isInit: Boolean = false,
     val trackType: Int = C.TRACK_TYPE_DEFAULT,
     val dataSpec: DataSpec,
+    val dependencyKeys: List<String> = emptyList(),
     @Volatile var status: Status = Status.QUEUED,
     @Volatile var bytesDownloaded: Long = 0L,
     @Volatile var totalBytes: Long = -1L,
