@@ -249,9 +249,38 @@ class PlaybackSessionState(
         activeLeases.clear()
     }
 
+    companion object {
+        const val DEFAULT_LEASE_DURATION_MS = 120_000L
+        const val BACKWARD_RETENTION_US = 30_000_000L // 30s backward seek recovery window
+    }
+
     fun isResourceActive(key: String, nowMs: Long = System.currentTimeMillis()): Boolean {
         if (lifecycle == Lifecycle.RELEASED) return false
         if (isKeyLeased(key, nowMs)) return true
+
+        // If prefetch mode is enabled, evaluate rolling media-time retention window
+        if (prefetchModeEnabled) {
+            val coordinator = prefetchCoordinator
+            if (coordinator != null) {
+                // If it's currently being downloaded by prefetch worker or requested by Media3
+                if (coordinator.scheduler.media3ActiveRequests.any { it.cacheKey == key }) return true
+                if (coordinator.scheduler.isActivelyWritingKey(key)) return true
+
+                // Check request registry for media time metadata
+                val req = coordinator.scheduler.registry.values.firstOrNull { it.identity.cacheKey == key }
+                if (req != null) {
+                    if (req.isInit) return true // Initialization segment is always protected
+                    val currentPosUs = coordinator.latestSnapshot?.currentPositionUs ?: playbackPositionUs
+                    val backwardProtectUs = maxOf(0L, currentPosUs - BACKWARD_RETENTION_US)
+                    // If segment end is at or after backward protect window, it is protected
+                    if (req.mediaTimeUs + req.durationUs >= backwardProtectUs) {
+                        return true
+                    }
+                    // Segment is older than backward retention window: eligible for eviction!
+                    return false
+                }
+            }
+        }
 
         // Check against active media URI
         val src = sourceUri ?: return false
@@ -264,8 +293,8 @@ class PlaybackSessionState(
         val norm = normalizedSourceUri
         if (norm != null && PlaybackCacheManager.normalizeUri(rawUrl) == norm) return true
 
-        // If directory scope (HLS/DASH), check directory prefix
-        if (isPlaylist) {
+        // If directory scope (HLS/DASH), check directory prefix when prefetch mode is not active
+        if (isPlaylist && !prefetchModeEnabled) {
             val prefix = PlaybackCacheManager.keyPrefix(src, directoryScope = true)
             if (prefix.isNotBlank() && (key.startsWith(prefix) || rawUrl.startsWith(prefix))) {
                 return true
@@ -284,9 +313,5 @@ class PlaybackSessionState(
         networkMonitor.reset()
         lifecycle = Lifecycle.RELEASED
         PlaybackCacheManager.unregisterSession(sessionId)
-    }
-
-    companion object {
-        const val DEFAULT_LEASE_DURATION_MS = 60_000L
     }
 }

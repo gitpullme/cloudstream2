@@ -95,19 +95,38 @@ class HlsPrefetchAdapter(
         }
 
         // 2. Media Segments
-        var segmentStartTimeUs = mediaPlaylist.startTimeUs
+        // Determine timeline offset between playlist segments and player presentation window
+        val timelineOffsetUs = if (isVod) {
+            0L
+        } else {
+            // For live/sliding playlist, segment.relativeStartTimeUs is relative to current snapshot start
+            if (snapshot.windowPositionInPeriodUs > 0L && mediaPlaylist.startTimeUs > 0L && !mediaPlaylist.hasProgramDateTime) {
+                mediaPlaylist.startTimeUs - snapshot.windowPositionInPeriodUs
+            } else {
+                0L
+            }
+        }
+
         var liveSegmentsScheduled = 0
+        var firstScheduledUs: Long? = null
+        var upcomingCount = 0
 
         for (segment in mediaPlaylist.segments) {
+            val segmentPresentationStartUs = segment.relativeStartTimeUs + timelineOffsetUs
             val segmentDurationUs = segment.durationUs
-            val segmentEndTimeUs = segmentStartTimeUs + segmentDurationUs
+            val segmentPresentationEndUs = segmentPresentationStartUs + segmentDurationUs
 
             // For live streams, constrain prefetch to at most 3 segments beyond the playhead
-            if (!isVod && segmentStartTimeUs > snapshot.currentPositionUs) {
+            if (!isVod && segmentPresentationStartUs > snapshot.currentPositionUs) {
                 if (liveSegmentsScheduled >= 3) break
             }
 
-            if (segmentEndTimeUs > prefetchStartUs) {
+            if (segmentPresentationEndUs > prefetchStartUs) {
+                if (firstScheduledUs == null) {
+                    firstScheduledUs = segmentPresentationStartUs
+                }
+                upcomingCount++
+
                 val segUri = UriUtil.resolveToUri(baseUri, segment.url)
                 val segLength = if (segment.byteRangeLength > 0) segment.byteRangeLength else C.LENGTH_UNSET.toLong()
                 val spec = DataSpec.Builder()
@@ -131,15 +150,15 @@ class HlsPrefetchAdapter(
 
                 val identity = PrefetchRequestIdentity.fromDataSpec(spec, cacheKeyFactory, defaultHeaders)
                 val priority = when {
-                    segmentStartTimeUs <= prefetchStartUs + NEAR_PLAYHEAD_US -> PrefetchRequest.Priority.NEXT_MEDIA
-                    segmentStartTimeUs <= prefetchStartUs + FORWARD_RUNWAY_US -> PrefetchRequest.Priority.FORWARD_MEDIA
+                    segmentPresentationStartUs <= prefetchStartUs + NEAR_PLAYHEAD_US -> PrefetchRequest.Priority.NEXT_MEDIA
+                    segmentPresentationStartUs <= prefetchStartUs + FORWARD_RUNWAY_US -> PrefetchRequest.Priority.FORWARD_MEDIA
                     else -> PrefetchRequest.Priority.USEFUL_PREFETCH
                 }
 
                 requests += PrefetchRequest(
                     identity = identity,
                     priority = priority,
-                    mediaTimeUs = segmentStartTimeUs,
+                    mediaTimeUs = segmentPresentationStartUs,
                     durationUs = segmentDurationUs,
                     isInit = false,
                     trackType = C.TRACK_TYPE_VIDEO,
@@ -150,10 +169,37 @@ class HlsPrefetchAdapter(
                     liveSegmentsScheduled++
                 }
             }
-
-            segmentStartTimeUs = segmentEndTimeUs
         }
 
+        maybeLogDiagnostics(mediaPlaylist, snapshot, upcomingCount, firstScheduledUs)
+
         return requests
+    }
+
+    private var lastLogTimeMs = 0L
+    private fun maybeLogDiagnostics(
+        mediaPlaylist: HlsMediaPlaylist,
+        snapshot: PlaybackPlayerSnapshot,
+        upcomingCount: Int,
+        firstScheduledSegmentTimeUs: Long?,
+    ) {
+        val now = System.currentTimeMillis()
+        if (now - lastLogTimeMs < 3000L) return
+        lastLogTimeMs = now
+
+        Log.d(
+            TAG,
+            "HLS Timeline: hasProgramDateTime=${mediaPlaylist.hasProgramDateTime}, rawStartTimeUs=${mediaPlaylist.startTimeUs}, " +
+                "durationUs=${mediaPlaylist.durationUs}, playerPosMs=${snapshot.currentPositionMs}, bufferedPosMs=${snapshot.bufferedPositionMs}, " +
+                "segmentsTotal=${mediaPlaylist.segments.size}, upcomingScheduled=$upcomingCount, firstScheduledUs=$firstScheduledSegmentTimeUs"
+        )
+
+        val playlistEndUs = mediaPlaylist.segments.lastOrNull()?.let { it.relativeStartTimeUs + it.durationUs } ?: 0L
+        if (playlistEndUs > 0L && snapshot.currentPositionUs > playlistEndUs + 30_000_000L) {
+            Log.w(
+                TAG,
+                "HLS Timeline mismatch warning: player position (${snapshot.currentPositionUs / 1000}ms) exceeds playlist segments end (${playlistEndUs / 1000}ms)"
+            )
+        }
     }
 }

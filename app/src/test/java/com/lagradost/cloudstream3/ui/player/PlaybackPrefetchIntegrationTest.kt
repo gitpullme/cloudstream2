@@ -371,4 +371,145 @@ class PlaybackPrefetchIntegrationTest {
         assertEquals(0, coordinator.scheduler.getActiveWorkerCount())
         assertTrue("All leases must be released on session release", session.getActiveLeasedKeys().isEmpty())
     }
+
+    @Test
+    fun `continuous rolling prefetch reclaims obsolete spans behind 30s playback window under small cache limit`() = runBlocking {
+        val limitBytes = 5L * 1024L * 1024L
+        val chunkSize = 2 * 1024 * 1024 // 2 MB each
+        val chunk1Data = ByteArray(chunkSize) { 1 }
+        val chunk2Data = ByteArray(chunkSize) { 2 }
+        val chunk3Data = ByteArray(chunkSize) { 3 }
+
+        val uri1 = Uri.parse("https://cdn.example.com/hls/seg1.ts")
+        val uri2 = Uri.parse("https://cdn.example.com/hls/seg2.ts")
+        val uri3 = Uri.parse("https://cdn.example.com/hls/seg3.ts")
+
+        val dataMap = mapOf(
+            uri1 to chunk1Data,
+            uri2 to chunk2Data,
+            uri3 to chunk3Data,
+        )
+
+        val upstream = object : DataSource {
+            private var currentUri: Uri? = null
+            private var currentData: ByteArray? = null
+            private var offset = 0
+
+            override fun addTransferListener(transferListener: TransferListener) = Unit
+            override fun open(dataSpec: DataSpec): Long {
+                currentUri = dataSpec.uri
+                currentData = dataMap[dataSpec.uri] ?: throw IOException("URI not found: ${dataSpec.uri}")
+                offset = dataSpec.position.toInt()
+                return (currentData!!.size - offset).toLong()
+            }
+            override fun read(buffer: ByteArray, bufferOffset: Int, length: Int): Int {
+                val data = currentData ?: return -1
+                val remaining = data.size - offset
+                if (remaining <= 0) return -1
+                val bytesToRead = minOf(length, remaining)
+                System.arraycopy(data, offset, buffer, bufferOffset, bytesToRead)
+                offset += bytesToRead
+                return bytesToRead
+            }
+            override fun getUri(): Uri? = currentUri
+            override fun close() {
+                currentUri = null
+                currentData = null
+            }
+        }
+        val upstreamFactory = DataSource.Factory { upstream }
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory { it.key ?: it.uri.toString() }
+        }
+
+        val session = PlaybackSessionState(
+            sourceUri = "https://cdn.example.com/hls/playlist.m3u8",
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = limitBytes,
+        )
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // 1. Prefetch seg1 (0..6s, 2MB)
+        val req1 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = uri1, cacheKey = uri1.toString(), length = chunkSize.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 6_000_000L,
+            dataSpec = DataSpec(uri1, 0, chunkSize.toLong()),
+        )
+        // 2. Prefetch seg2 (6..12s, 2MB)
+        val req2 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = uri2, cacheKey = uri2.toString(), length = chunkSize.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 6_000_000L,
+            durationUs = 6_000_000L,
+            dataSpec = DataSpec(uri2, 0, chunkSize.toLong()),
+        )
+
+        // Download both into cache (4 MB total)
+        val w1 = CacheWriter(cacheDataSourceFactory.createDataSource(), req1.dataSpec, ByteArray(1024), null)
+        w1.cache()
+        coordinator.scheduler.registry[req1.identity] = req1
+        req1.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(req1)
+
+        val w2 = CacheWriter(cacheDataSourceFactory.createDataSource(), req2.dataSpec, ByteArray(1024), null)
+        w2.cache()
+        coordinator.scheduler.registry[req2.identity] = req2
+        req2.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(req2)
+
+        assertTrue(simpleCache.isCached(uri1.toString(), 0, chunkSize.toLong()))
+        assertTrue(simpleCache.isCached(uri2.toString(), 0, chunkSize.toLong()))
+        assertEquals(4L * 1024 * 1024, simpleCache.cacheSpace)
+
+        // 3. Playback advances to 45 seconds
+        session.playbackPositionUs = 45_000_000L
+
+        // Backward retention is 30s -> media ended before 15s (45s - 30s) is eligible for eviction
+        // seg1 ended at 6s -> eligible!
+        assertFalse("seg1 must be eligible for eviction", session.isResourceActive(uri1.toString()))
+
+        // 4. Evict obsolete span seg1 to make room for seg3
+        val spans = simpleCache.getCachedSpans(uri1.toString())
+        for (span in spans) {
+            simpleCache.removeSpan(span)
+        }
+
+        // Now prefetch seg3
+        val req3 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = uri3, cacheKey = uri3.toString(), length = chunkSize.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 45_000_000L,
+            durationUs = 6_000_000L,
+            dataSpec = DataSpec(uri3, 0, chunkSize.toLong()),
+        )
+        val w3 = CacheWriter(cacheDataSourceFactory.createDataSource(), req3.dataSpec, ByteArray(1024), null)
+        w3.cache()
+        coordinator.scheduler.registry[req3.identity] = req3
+        req3.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(req3)
+
+        // seg1 was evicted, seg3 was cached
+        assertFalse(simpleCache.isCached(uri1.toString(), 0, chunkSize.toLong()))
+        assertTrue(simpleCache.isCached(uri3.toString(), 0, chunkSize.toLong()))
+
+        // Cache space remains within 5 MB limit
+        assertTrue("Total cache space must be <= limit (5 MB)", simpleCache.cacheSpace <= limitBytes)
+
+        coordinator.release()
+        session.release()
+    }
 }

@@ -5,9 +5,14 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.ParsableByteArray
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.container.Mp4Box
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.extractor.GaplessInfoHolder
+import androidx.media3.extractor.mp4.BoxParser
+import androidx.media3.extractor.mp4.TrackSampleTable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
@@ -19,7 +24,8 @@ import java.nio.ByteOrder
  * Requirements:
  * - Only selected when positively identified as supported progressive MP4.
  * - HTTP 206 Partial Content validation probe.
- * - Parses container index (sidx / segment index) to establish true byte-to-time mapping.
+ * - Parses container index (standard moov container sample tables or sidx) to establish true byte-to-time mapping.
+ * - Correctly calculates sidx byte offsets relative to box end.
  * - If reliable mapping or range support is not present, falls back safely to normal Media3 loading.
  */
 @OptIn(UnstableApi::class)
@@ -36,6 +42,9 @@ class Mp4RangePrefetchAdapter(
     companion object {
         private const val TAG = "Mp4RangePrefetch"
         const val DEFAULT_CHUNK_SIZE = 1024L * 1024L // 1 MB
+        const val PROBE_SIZE = 128L * 1024L // 128 KB
+        const val TAIL_PROBE_SIZE = 512L * 1024L // 512 KB
+        const val MAX_MOOV_SIZE = 15L * 1024L * 1024L // 15 MB max moov size
         private val CONTENT_RANGE_REGEX = Regex("""bytes\s+(\d+)-(\d+)/(\d+)""")
         private const val SIDX_FOURCC = 0x73696478 // "sidx"
     }
@@ -50,7 +59,13 @@ class Mp4RangePrefetchAdapter(
     private var verified = false
     private var isRangeSupported = false
     private var totalContentLength = -1L
-    private val parsedSegments = mutableListOf<Mp4Segment>()
+    val parsedSegments = mutableListOf<Mp4Segment>()
+
+    private fun safeUriString(uri: Uri): String {
+        return runCatching {
+            "${uri.scheme}://${uri.host}${uri.path}"
+        }.getOrDefault("unknown-uri")
+    }
 
     override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
         // Strict positive MP4 check: do not treat arbitrary formats (MKV, WebM, TS) as MP4
@@ -58,44 +73,70 @@ class Mp4RangePrefetchAdapter(
         val path = sourceUri.path?.lowercase().orEmpty()
         val isMp4Ext = path.endsWith(".mp4") || path.contains(".mp4?")
 
-        if (!isMp4Mime && !isMp4Ext) {
-            return false
-        }
-
         // Live / playlist formats are not progressive MP4
         if (mimeType == MimeTypes.APPLICATION_M3U8 || mimeType == MimeTypes.APPLICATION_MPD ||
             path.endsWith(".m3u8") || path.endsWith(".mpd")) {
             return false
         }
 
+        if (!isMp4Mime && !isMp4Ext) {
+            return false
+        }
+
         return verifyRangeAndIndexSupport()
+    }
+
+    private suspend fun readByteRange(offset: Long, length: Long): ByteArray? = withContext(Dispatchers.IO) {
+        if (length <= 0L) return@withContext ByteArray(0)
+        val spec = DataSpec.Builder()
+            .setUri(sourceUri)
+            .setPosition(offset)
+            .setLength(length)
+            .setHttpRequestHeaders(defaultHeaders)
+            .build()
+
+        val upstream = upstreamFactory.createDataSource()
+        val buffer = ByteArray(length.toInt())
+        var totalRead = 0
+        try {
+            upstream.open(spec)
+            while (totalRead < buffer.size) {
+                val read = upstream.read(buffer, totalRead, buffer.size - totalRead)
+                if (read < 0) break
+                totalRead += read
+            }
+            if (totalRead == buffer.size) buffer else buffer.copyOf(totalRead)
+        } catch (e: Throwable) {
+            Log.w(TAG, "readByteRange failed at $offset for $length on ${safeUriString(sourceUri)}: ${e.message}")
+            null
+        } finally {
+            runCatching { upstream.close() }
+        }
     }
 
     private suspend fun verifyRangeAndIndexSupport(): Boolean = withContext(Dispatchers.IO) {
         if (verified) return@withContext (isRangeSupported && parsedSegments.isNotEmpty())
 
-        // 1. Send range probe for the first 32 KB to verify 206 Partial Content and inspect headers
-        val probeLength = 32L * 1024L
         val probeSpec = DataSpec.Builder()
             .setUri(sourceUri)
             .setPosition(0L)
-            .setLength(probeLength)
+            .setLength(PROBE_SIZE)
             .setHttpRequestHeaders(defaultHeaders)
             .build()
 
         val upstream = upstreamFactory.createDataSource()
-        val probeBuffer = ByteArray(probeLength.toInt())
+        val probeBuffer = ByteArray(PROBE_SIZE.toInt())
         var bytesReadTotal = 0
 
         try {
-            val openedLength = upstream.open(probeSpec)
+            upstream.open(probeSpec)
             val responseHeaders = upstream.responseHeaders
 
             val contentRange = responseHeaders["Content-Range"]?.firstOrNull()
                 ?: responseHeaders["content-range"]?.firstOrNull()
 
             if (contentRange == null) {
-                Log.w(TAG, "server returned no Content-Range header (200 OK); range prefetch disabled for $sourceUri")
+                Log.w(TAG, "Server returned no Content-Range header (200 OK); range prefetch disabled for ${safeUriString(sourceUri)}")
                 isRangeSupported = false
                 verified = true
                 return@withContext false
@@ -103,7 +144,7 @@ class Mp4RangePrefetchAdapter(
 
             val match = CONTENT_RANGE_REGEX.find(contentRange)
             if (match == null) {
-                Log.w(TAG, "malformed Content-Range header: $contentRange; range prefetch disabled")
+                Log.w(TAG, "Malformed Content-Range header: $contentRange; range prefetch disabled")
                 isRangeSupported = false
                 verified = true
                 return@withContext false
@@ -115,7 +156,7 @@ class Mp4RangePrefetchAdapter(
             val total = totalStr.toLongOrNull() ?: -1L
 
             if (start != 0L || total <= 0L) {
-                Log.w(TAG, "inconsistent Content-Range values: $contentRange; range prefetch disabled")
+                Log.w(TAG, "Inconsistent Content-Range values: $contentRange; range prefetch disabled")
                 isRangeSupported = false
                 verified = true
                 return@withContext false
@@ -124,26 +165,25 @@ class Mp4RangePrefetchAdapter(
             totalContentLength = total
             isRangeSupported = true
 
-            // Read the initial probe bytes to check for index box (sidx)
             while (bytesReadTotal < probeBuffer.size) {
                 val read = upstream.read(probeBuffer, bytesReadTotal, probeBuffer.size - bytesReadTotal)
                 if (read < 0) break
                 bytesReadTotal += read
             }
 
-            // Attempt to parse MP4 sidx box to establish true byte-to-time mapping
-            parseSidxBox(probeBuffer, bytesReadTotal)
+            // Discover and parse container index (sidx or moov)
+            discoverAndParseIndex(probeBuffer, bytesReadTotal)
 
             verified = true
             if (parsedSegments.isNotEmpty()) {
-                Log.i(TAG, "MP4 range prefetch verified with ${parsedSegments.size} indexed segments for $sourceUri")
+                Log.i(TAG, "MP4 range prefetch verified with ${parsedSegments.size} segments for ${safeUriString(sourceUri)}")
                 true
             } else {
                 Log.i(TAG, "MP4 range supported but no verified container index found; falling back safely to standard Media3 progressive loading")
                 false
             }
         } catch (e: Throwable) {
-            Log.w(TAG, "range probe request failed: ${e.message}; range prefetch disabled")
+            Log.w(TAG, "Range probe request failed: ${e.message}; range prefetch disabled")
             isRangeSupported = false
             verified = true
             false
@@ -152,35 +192,277 @@ class Mp4RangePrefetchAdapter(
         }
     }
 
-    /**
-     * Parses standard ISO MP4 sidx box from initial bytes to establish exact byte-to-time intervals.
-     */
-    private fun parseSidxBox(data: ByteArray, length: Int) {
-        if (length < 16) return
-        var offset = 0
-        while (offset + 8 <= length) {
-            val bb = ByteBuffer.wrap(data, offset, length - offset).order(ByteOrder.BIG_ENDIAN)
-            val boxSize = bb.int.toLong() and 0xFFFFFFFFL
-            val boxType = bb.int
+    private suspend fun discoverAndParseIndex(probeBuffer: ByteArray, bytesReadTotal: Int) {
+        var sidxFound = false
+        var moovFound = false
 
-            if (boxSize < 8 || offset + boxSize > length) {
-                // If box is sidx and spans beyond probe buffer, or invalid
-                if (boxType == SIDX_FOURCC && offset + 12 <= length) {
-                    parseSidxPayload(bb, offset + 8, totalContentLength)
-                }
-                break
+        // 1. Scan top-level boxes in initial probe buffer
+        var offset = 0
+        while (offset + 8 <= bytesReadTotal) {
+            val bb = ByteBuffer.wrap(probeBuffer, offset, bytesReadTotal - offset).order(ByteOrder.BIG_ENDIAN)
+            var boxSize = bb.int.toLong() and 0xFFFFFFFFL
+            val boxType = bb.int
+            var headerSize = 8
+
+            if (boxSize == 1L) {
+                if (offset + 16 > bytesReadTotal) break
+                boxSize = bb.long
+                headerSize = 16
+            } else if (boxSize == 0L) {
+                boxSize = totalContentLength - offset
             }
 
+            if (boxSize < headerSize) break
+
             if (boxType == SIDX_FOURCC) {
-                parseSidxPayload(bb, offset + 8, totalContentLength)
-                break
+                val sidxBytes = if (offset + boxSize <= bytesReadTotal) {
+                    probeBuffer.copyOfRange(offset, (offset + boxSize).toInt())
+                } else {
+                    readByteRange(offset.toLong(), boxSize)
+                }
+                if (sidxBytes != null && sidxBytes.size >= headerSize) {
+                    val sidxBb = ByteBuffer.wrap(sidxBytes).order(ByteOrder.BIG_ENDIAN)
+                    sidxBb.position(headerSize)
+                    parseSidxPayload(sidxBb, offset.toLong(), boxSize)
+                    if (parsedSegments.isNotEmpty()) {
+                        sidxFound = true
+                        Log.i(TAG, "Parsed ${parsedSegments.size} segments from sidx box for ${safeUriString(sourceUri)}")
+                        break
+                    }
+                }
+            } else if (boxType == Mp4Box.TYPE_moov) {
+                if (boxSize <= MAX_MOOV_SIZE) {
+                    val moovBytes = if (offset + boxSize <= bytesReadTotal) {
+                        probeBuffer.copyOfRange(offset, (offset + boxSize).toInt())
+                    } else {
+                        readByteRange(offset.toLong(), boxSize)
+                    }
+                    if (moovBytes != null && moovBytes.size >= headerSize) {
+                        moovFound = parseMoovBytes(moovBytes, headerSize)
+                        if (moovFound) {
+                            Log.i(TAG, "Parsed ${parsedSegments.size} segments from moov box at beginning for ${safeUriString(sourceUri)}")
+                            break
+                        }
+                    }
+                }
             }
 
             offset += boxSize.toInt()
         }
+
+        // 2. If neither sidx nor moov found at beginning, probe file tail for moov
+        if (!sidxFound && !moovFound && totalContentLength > bytesReadTotal) {
+            val tailReadLength = minOf(TAIL_PROBE_SIZE, totalContentLength)
+            val tailOffset = totalContentLength - tailReadLength
+            val tailBytes = readByteRange(tailOffset, tailReadLength)
+            if (tailBytes != null) {
+                var tailPos = 0
+                while (tailPos + 8 <= tailBytes.size) {
+                    val bb = ByteBuffer.wrap(tailBytes, tailPos, tailBytes.size - tailPos).order(ByteOrder.BIG_ENDIAN)
+                    var boxSize = bb.int.toLong() and 0xFFFFFFFFL
+                    val boxType = bb.int
+                    var headerSize = 8
+
+                    if (boxSize == 1L) {
+                        if (tailPos + 16 > tailBytes.size) break
+                        boxSize = bb.long
+                        headerSize = 16
+                    } else if (boxSize == 0L) {
+                        boxSize = totalContentLength - (tailOffset + tailPos)
+                    }
+
+                    if (boxSize < headerSize) {
+                        tailPos++
+                        continue
+                    }
+
+                    if (boxType == Mp4Box.TYPE_moov) {
+                        val moovAbsOffset = tailOffset + tailPos
+                        if (boxSize <= MAX_MOOV_SIZE && moovAbsOffset + boxSize <= totalContentLength) {
+                            val fullMoovBytes = if (tailPos + boxSize <= tailBytes.size) {
+                                tailBytes.copyOfRange(tailPos, (tailPos + boxSize).toInt())
+                            } else {
+                                readByteRange(moovAbsOffset, boxSize)
+                            }
+                            if (fullMoovBytes != null && fullMoovBytes.size >= headerSize) {
+                                moovFound = parseMoovBytes(fullMoovBytes, headerSize)
+                                if (moovFound) {
+                                    Log.i(TAG, "Parsed ${parsedSegments.size} segments from moov box at tail for ${safeUriString(sourceUri)}")
+                                    break
+                                }
+                            }
+                        }
+                    } else if (boxType == SIDX_FOURCC) {
+                        val sidxAbsOffset = tailOffset + tailPos
+                        val fullSidxBytes = if (tailPos + boxSize <= tailBytes.size) {
+                            tailBytes.copyOfRange(tailPos, (tailPos + boxSize).toInt())
+                        } else {
+                            readByteRange(sidxAbsOffset, boxSize)
+                        }
+                        if (fullSidxBytes != null && fullSidxBytes.size >= headerSize) {
+                            val sidxBb = ByteBuffer.wrap(fullSidxBytes).order(ByteOrder.BIG_ENDIAN)
+                            sidxBb.position(headerSize)
+                            parseSidxPayload(sidxBb, sidxAbsOffset, boxSize)
+                            if (parsedSegments.isNotEmpty()) {
+                                sidxFound = true
+                                Log.i(TAG, "Parsed ${parsedSegments.size} segments from sidx box at tail for ${safeUriString(sourceUri)}")
+                                break
+                            }
+                        }
+                    }
+                    tailPos += boxSize.toInt()
+                }
+            }
+        }
     }
 
-    private fun parseSidxPayload(bb: ByteBuffer, payloadOffset: Int, totalBytes: Long) {
+    private fun parseMoovBytes(moovBytes: ByteArray, headerSize: Int): Boolean {
+        return try {
+            val moovContainer = parseContainerBox(
+                boxType = Mp4Box.TYPE_moov,
+                data = moovBytes,
+                startOffset = headerSize,
+                endOffset = moovBytes.size,
+            )
+
+            val sampleTables = BoxParser.parseTraks(
+                moovContainer,
+                GaplessInfoHolder(),
+                C.TIME_UNSET,
+                null,
+                false,
+                false,
+                { track -> track },
+                false,
+            )
+
+            if (sampleTables.isNullOrEmpty()) return false
+
+            val primaryTable = sampleTables.firstOrNull { it.track.type == C.TRACK_TYPE_VIDEO }
+                ?: sampleTables.firstOrNull { it.track.type == C.TRACK_TYPE_AUDIO }
+                ?: sampleTables.firstOrNull()
+
+            if (primaryTable == null || primaryTable.sampleCount <= 0) return false
+
+            coalesceSamplesIntoSegments(primaryTable)
+            parsedSegments.isNotEmpty()
+        } catch (t: Throwable) {
+            Log.w(TAG, "parseMoovBytes failed: ${t.message}")
+            false
+        }
+    }
+
+    private fun isContainerBox(type: Int): Boolean {
+        return type == Mp4Box.TYPE_moov ||
+            type == Mp4Box.TYPE_trak ||
+            type == Mp4Box.TYPE_mdia ||
+            type == Mp4Box.TYPE_minf ||
+            type == Mp4Box.TYPE_stbl ||
+            type == Mp4Box.TYPE_edts
+    }
+
+    internal fun parseContainerBox(
+        boxType: Int,
+        data: ByteArray,
+        startOffset: Int,
+        endOffset: Int,
+    ): Mp4Box.ContainerBox {
+        val container = Mp4Box.ContainerBox(boxType, endOffset.toLong())
+        var pos = startOffset
+        while (pos + 8 <= endOffset) {
+            val boxStart = pos
+            val bb = ByteBuffer.wrap(data, pos, endOffset - pos).order(ByteOrder.BIG_ENDIAN)
+            var boxSize = bb.int.toLong() and 0xFFFFFFFFL
+            val type = bb.int
+            var headerSize = 8
+
+            if (boxSize == 1L) {
+                if (pos + 16 > endOffset) break
+                boxSize = bb.long
+                headerSize = 16
+            } else if (boxSize == 0L) {
+                boxSize = (endOffset - pos).toLong()
+            }
+
+            if (boxSize < headerSize || pos + boxSize > endOffset) {
+                break
+            }
+
+            val boxEnd = (pos + boxSize).toInt()
+            val payloadStart = pos + headerSize
+
+            if (isContainerBox(type)) {
+                val child = parseContainerBox(type, data, payloadStart, boxEnd)
+                container.add(child)
+            } else {
+                val leafBytes = ByteArray(boxSize.toInt())
+                System.arraycopy(data, boxStart, leafBytes, 0, boxSize.toInt())
+                val leaf = Mp4Box.LeafBox(type, ParsableByteArray(leafBytes))
+                container.add(leaf)
+            }
+            pos = boxEnd
+        }
+        return container
+    }
+
+    internal fun coalesceSamplesIntoSegments(table: TrackSampleTable) {
+        parsedSegments.clear()
+        var currentChunkStartOffset = -1L
+        var currentChunkLength = 0L
+        var currentChunkStartUs = 0L
+        var currentChunkLastEndUs = 0L
+
+        for (i in 0 until table.sampleCount) {
+            val sampleOffset = table.offsets[i]
+            val sampleSize = table.sizes[i].toLong()
+            val sampleTimeUs = table.timestampsUs[i]
+            val sampleDurationUs = if (i + 1 < table.sampleCount) {
+                maxOf(0L, table.timestampsUs[i + 1] - sampleTimeUs)
+            } else {
+                maxOf(0L, table.durationUs - sampleTimeUs)
+            }
+
+            if (currentChunkStartOffset == -1L) {
+                currentChunkStartOffset = sampleOffset
+                currentChunkLength = sampleSize
+                currentChunkStartUs = sampleTimeUs
+                currentChunkLastEndUs = sampleTimeUs + sampleDurationUs
+            } else {
+                val gap = sampleOffset - (currentChunkStartOffset + currentChunkLength)
+                val canBridge = gap in 0..(128 * 1024L)
+                val shouldSplit = (currentChunkLength + (if (canBridge) gap else 0L) + sampleSize > chunkSize) || !canBridge
+
+                if (shouldSplit) {
+                    val chunkDurationUs = maxOf(0L, currentChunkLastEndUs - currentChunkStartUs)
+                    parsedSegments += Mp4Segment(
+                        byteOffset = currentChunkStartOffset,
+                        byteLength = currentChunkLength,
+                        startTimeUs = currentChunkStartUs,
+                        durationUs = chunkDurationUs,
+                    )
+                    currentChunkStartOffset = sampleOffset
+                    currentChunkLength = sampleSize
+                    currentChunkStartUs = sampleTimeUs
+                    currentChunkLastEndUs = sampleTimeUs + sampleDurationUs
+                } else {
+                    currentChunkLength += gap + sampleSize
+                    currentChunkLastEndUs = maxOf(currentChunkLastEndUs, sampleTimeUs + sampleDurationUs)
+                }
+            }
+        }
+
+        if (currentChunkStartOffset != -1L && currentChunkLength > 0L) {
+            val chunkDurationUs = maxOf(0L, currentChunkLastEndUs - currentChunkStartUs)
+            parsedSegments += Mp4Segment(
+                byteOffset = currentChunkStartOffset,
+                byteLength = currentChunkLength,
+                startTimeUs = currentChunkStartUs,
+                durationUs = chunkDurationUs,
+            )
+        }
+    }
+
+    private fun parseSidxPayload(bb: ByteBuffer, sidxOffset: Long, sidxSize: Long) {
         try {
             val version = bb.get().toInt() and 0xFF
             bb.get() // flags (3 bytes)
@@ -205,7 +487,9 @@ class Mp4RangePrefetchAdapter(
             val referenceCount = bb.short.toInt() and 0xFFFF
             if (referenceCount <= 0) return
 
-            var currentByteOffset = firstOffset
+            // ISO BMFF Section 8.16.3: firstOffset is relative to the anchor point (byte immediately following sidx box)
+            val anchorPoint = sidxOffset + sidxSize
+            var currentByteOffset = anchorPoint + firstOffset
             var currentMediaTimeUs = (earliestPresentationTime * 1_000_000L) / timescale
 
             for (i in 0 until referenceCount) {

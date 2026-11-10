@@ -108,6 +108,10 @@ class PrefetchRequestScheduler(
 
     fun getQueueDepth(): Int = synchronized(lock) { priorityQueue.size }
 
+    fun isActivelyWritingKey(cacheKey: String): Boolean {
+        return registry.values.any { it.status == PrefetchRequest.Status.RUNNING && it.identity.cacheKey == cacheKey }
+    }
+
     /**
      * Enqueues or deduplicates a prefetch request.
      */
@@ -128,10 +132,10 @@ class PrefetchRequestScheduler(
         // Check if resource is already in SimpleCache
         val cache = getCache()
         if (cache != null) {
-            val length = if (identity.length > 0) identity.length else 1L
-            if (cache.isCached(identity.cacheKey, identity.position, length)) {
+            if (CacheCoverageVerifier.isFullyCached(cache, identity.cacheKey, identity.position, identity.length)) {
                 cacheHitCount.incrementAndGet()
                 request.status = PrefetchRequest.Status.COMPLETED
+                session.prefetchCoordinator?.registerCompletedRequest(request)
                 return request
             }
         }
@@ -219,6 +223,16 @@ class PrefetchRequestScheduler(
                     obsoleteRequests += req
                 }
             }
+
+            for (req in registry.values) {
+                if (!req.isInit && req.mediaTimeUs < newPositionUs - 10_000_000L) {
+                    if (req.status != PrefetchRequest.Status.COMPLETED && req.status != PrefetchRequest.Status.CANCELLED) {
+                        req.status = PrefetchRequest.Status.CANCELLED
+                        cancelledCount.incrementAndGet()
+                        obsoleteRequests += req
+                    }
+                }
+            }
         }
 
         for (req in obsoleteRequests) {
@@ -282,10 +296,10 @@ class PrefetchRequestScheduler(
         }
 
         // Verify if already cached
-        val length = if (request.identity.length > 0) request.identity.length else 1L
-        if (cache.isCached(request.identity.cacheKey, request.identity.position, length)) {
+        if (CacheCoverageVerifier.isFullyCached(cache, request.identity.cacheKey, request.identity.position, request.identity.length)) {
             cacheHitCount.incrementAndGet()
             request.status = PrefetchRequest.Status.COMPLETED
+            session.prefetchCoordinator?.registerCompletedRequest(request)
             return
         }
 
@@ -324,7 +338,9 @@ class PrefetchRequestScheduler(
         val startTime = clock()
         try {
             writer.cache()
+            CacheCoverageVerifier.markCompleted(request.identity.cacheKey)
             request.status = PrefetchRequest.Status.COMPLETED
+            session.prefetchCoordinator?.registerCompletedRequest(request)
             onDownloadSuccess(request.bytesDownloaded, clock() - startTime)
         } catch (e: Throwable) {
             if (e is CancellationException || (e is IOException && e.message?.contains("canceled", ignoreCase = true) == true)) {
@@ -376,15 +392,27 @@ class PrefetchRequestScheduler(
             PlaybackCacheManager.maxBytes()
         }
 
+        val estimatedBytes = if (request.identity.length > 0) request.identity.length else 512 * 1024L
         val totalUsedAndReserved = currentUsage + reservedBytes.get()
 
-        if (limit > 0L && totalUsedAndReserved >= limit) {
-            // ONLY genuine Media3 playback requests may proceed when at or over the budget
-            val isMedia3Playback = request.priority == PrefetchRequest.Priority.IMMEDIATE &&
-                media3ActiveRequests.contains(request.identity)
+        if (limit > 0L && totalUsedAndReserved + estimatedBytes > limit) {
+            // Attempt proactive reclamation of obsolete spans (outside 30s retention window)
+            val neededReclamation = (totalUsedAndReserved + estimatedBytes) - limit
+            PlaybackCacheManager.makeRoomForPrefetch(
+                session = session,
+                requiredBytes = neededReclamation,
+                snapshot = session.prefetchCoordinator?.latestSnapshot,
+            )
 
-            // Background prefetch (NEXT_MEDIA, FORWARD_MEDIA, USEFUL_PREFETCH, SPECULATIVE) is strictly blocked
-            return isMedia3Playback
+            val updatedUsageAndReserved = PlaybackCacheManager.usageBytes() + reservedBytes.get()
+            if (updatedUsageAndReserved + estimatedBytes > limit) {
+                // ONLY genuine Media3 playback requests may proceed when at or over the budget
+                val isMedia3Playback = request.priority == PrefetchRequest.Priority.IMMEDIATE &&
+                    media3ActiveRequests.contains(request.identity)
+
+                // Background prefetch is blocked until playback advances or cache is cleared
+                return isMedia3Playback
+            }
         }
 
         return true

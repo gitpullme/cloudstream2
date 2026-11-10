@@ -273,6 +273,50 @@ object PlaybackCacheManager {
 
     fun maxBytes(): Long = configuredBytes
 
+    data class ReclamationResult(
+        val bytesReclaimed: Long,
+        val success: Boolean,
+        val reason: String? = null,
+    )
+
+    /**
+     * Safely reclaims storage from low-value media (older sessions or segments behind the
+     * playback retention window) to make room for upcoming prefetch downloads.
+     */
+    fun makeRoomForPrefetch(
+        session: PlaybackSessionState,
+        requiredBytes: Long,
+        snapshot: PlaybackPlayerSnapshot?,
+    ): ReclamationResult {
+        synchronized(lock) {
+            val c = cache ?: return ReclamationResult(0L, false, "Cache not initialized")
+            val ev = evictor ?: return ReclamationResult(0L, false, "Evictor not initialized")
+
+            val limit = if (session.prefetchLimitBytes > 0L) session.prefetchLimitBytes else configuredBytes
+            val currentUsage = ev.usageBytes()
+            if (currentUsage + requiredBytes <= limit) {
+                return ReclamationResult(0L, true, "Already sufficient room")
+            }
+
+            val targetReclaimBytes = (currentUsage + requiredBytes) - limit
+            val freed = ev.reclaimBytes(c, targetReclaimBytes)
+            val success = (ev.usageBytes() + requiredBytes <= limit)
+            Log.d(TAG, "makeRoomForPrefetch: required=${requiredBytes / 1024}KB, freed=${freed / 1024}KB, success=$success")
+            return ReclamationResult(
+                bytesReclaimed = freed,
+                success = success,
+                reason = if (!success) "Insufficient reclaimable space" else null,
+            )
+        }
+    }
+
+    /**
+     * Computes the number of bytes occupied by non-protected spans eligible for reclamation.
+     */
+    fun reclaimableBytes(session: PlaybackSessionState, snapshot: PlaybackPlayerSnapshot?): Long {
+        return evictor?.reclaimableBytes() ?: 0L
+    }
+
     fun snapshot(): CacheSnapshot = CacheSnapshot(
         usageBytes = usageBytes(),
         maxBytes = configuredBytes,
@@ -391,6 +435,58 @@ object PlaybackCacheManager {
         fun usageBytes(): Long = synchronized(lock) { currentSize }
 
         fun writtenBytes(): Long = totalWrittenBytes
+
+        fun reclaimableBytes(): Long = synchronized(lock) {
+            lru.filter { span ->
+                span !in pendingRemoval && !PlaybackCacheManager.isSpanActive(span.key)
+            }.sumOf { it.length }
+        }
+
+        fun reclaimBytes(cache: Cache, targetBytes: Long): Long {
+            attachedCache = cache
+            var freed = 0L
+            val failedVictims = mutableSetOf<CacheSpan>()
+
+            while (freed < targetBytes) {
+                // 1. Under lock: select eligible victim
+                val victim: CacheSpan? = synchronized(lock) {
+                    val candidate = lru.firstOrNull { span ->
+                        span !in failedVictims && span !in pendingRemoval && !PlaybackCacheManager.isSpanActive(span.key)
+                    }
+                    candidate?.also {
+                        pendingRemoval.add(it)
+                        removeLocked(it)
+                    }
+                }
+                if (victim == null) break
+
+                // 2. Outside lock: execute SimpleCache removal
+                val success = try {
+                    cache.removeSpan(victim)
+                    true
+                } catch (t: Throwable) {
+                    Log.w(TAG, "cache reclamation failed for ${victim.key}", t)
+                    false
+                }
+
+                // 3. Under lock: confirm removal or rollback
+                if (success) {
+                    synchronized(lock) {
+                        pendingRemoval.remove(victim)
+                    }
+                    freed += victim.length
+                    CacheCoverageVerifier.unmarkCompleted(victim.key)
+                } else {
+                    synchronized(lock) {
+                        pendingRemoval.remove(victim)
+                        addLocked(victim)
+                        failedVictims.add(victim)
+                    }
+                    reconcile(cache)
+                }
+            }
+            return freed
+        }
 
         override fun requiresCacheSpanTouches(): Boolean = true
 

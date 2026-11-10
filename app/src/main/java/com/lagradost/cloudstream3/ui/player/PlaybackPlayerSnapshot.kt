@@ -4,6 +4,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.OptIn
+import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
@@ -32,6 +33,9 @@ data class PlaybackPlayerSnapshot(
     val selectedMime: String?,
     val isLive: Boolean,
     val currentTracks: Tracks?,
+    val windowPositionInPeriodUs: Long = 0L,
+    val windowDurationUs: Long = C.TIME_UNSET,
+    val windowDefaultStartPositionUs: Long = 0L,
 ) {
     val currentPositionUs: Long get() = currentPositionMs * 1000L
     val bufferedPositionUs: Long get() = bufferedPositionMs * 1000L
@@ -51,6 +55,22 @@ data class PlaybackPlayerSnapshot(
             val player = playerProvider() ?: return null
             return try {
                 runOnPlayerThread(player) { p ->
+                    val timeline = runCatching { p.currentTimeline }.getOrNull()
+                    var winPosInPeriodUs = 0L
+                    var winDurUs = C.TIME_UNSET
+                    var winDefStartUs = 0L
+                    if (timeline != null && !timeline.isEmpty) {
+                        val winIndex = runCatching { p.currentMediaItemIndex }.getOrDefault(0)
+                        if (winIndex in 0 until timeline.windowCount) {
+                            val window = androidx.media3.common.Timeline.Window()
+                            runCatching { timeline.getWindow(winIndex, window) }.onSuccess {
+                                winPosInPeriodUs = window.positionInFirstPeriodUs
+                                winDurUs = window.durationUs
+                                winDefStartUs = window.defaultPositionUs
+                            }
+                        }
+                    }
+
                     PlaybackPlayerSnapshot(
                         currentPositionMs = p.currentPosition,
                         bufferedPositionMs = p.bufferedPosition,
@@ -64,6 +84,9 @@ data class PlaybackPlayerSnapshot(
                         selectedMime = selectedMime,
                         isLive = isLive,
                         currentTracks = runCatching { p.currentTracks }.getOrNull(),
+                        windowPositionInPeriodUs = winPosInPeriodUs,
+                        windowDurationUs = winDurUs,
+                        windowDefaultStartPositionUs = winDefStartUs,
                     )
                 }
             } catch (e: Throwable) {

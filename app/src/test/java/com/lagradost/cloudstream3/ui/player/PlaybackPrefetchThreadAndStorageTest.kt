@@ -7,7 +7,13 @@ import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheWriter
+import androidx.media3.datasource.cache.NoOpCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser
 import kotlinx.coroutines.Dispatchers
@@ -241,5 +247,125 @@ class PlaybackPrefetchThreadAndStorageTest {
         // Should stop at 12s (12,000,000 Us), NOT jumping to 24s
         assertEquals(12_000_000L, contiguousEndUs)
         assertEquals(12_000L, contiguousEndUs / 1000L)
+    }
+
+    @Test
+    fun `CacheCoverageVerifier does not treat 1-byte cached unknown-length segment as complete`() {
+        val tempDir = java.io.File.createTempFile("cs3_cov_test", "").apply {
+            delete()
+            mkdirs()
+        }
+        val cache = SimpleCache(tempDir, NoOpCacheEvictor())
+        try {
+            val key = "unknown_len_segment"
+            val uri = Uri.parse("https://cdn.example.com/stream/unknown_seg.ts")
+
+            // Simulate upstream that serves 1 byte
+            val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+                setCache(cache)
+                setUpstreamDataSourceFactory {
+                    object : DataSource {
+                        private var read = false
+                        override fun addTransferListener(transferListener: TransferListener) = Unit
+                        override fun open(dataSpec: DataSpec): Long = 100L // Advertised length 100
+                        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                            if (read) return -1
+                            buffer[offset] = 0x42
+                            read = true
+                            return 1 // Only 1 byte read so far
+                        }
+                        override fun getUri(): Uri = uri
+                        override fun close() = Unit
+                    }
+                }
+                setCacheKeyFactory { key }
+            }
+
+            // CacheWriter caches 1 byte
+            val writer = CacheWriter(
+                cacheDataSourceFactory.createDataSource(),
+                DataSpec.Builder().setUri(uri).setPosition(0L).setLength(1L).build(),
+                ByteArray(1024),
+                null,
+            )
+            writer.cache()
+
+            // 1 byte is cached
+            assertTrue("At least 1 byte must be cached", cache.isCached(key, 0L, 1L))
+
+            // When length is unknown (length <= 0) and not marked completed, must NOT be considered fully complete
+            assertFalse(
+                "1-byte cached segment of unknown total length must NOT be treated as fully complete",
+                CacheCoverageVerifier.isFullyCached(cache, key, 0L, -1L)
+            )
+
+            // Once marked completed (EOF reached by CacheWriter)
+            CacheCoverageVerifier.markCompleted(key)
+            assertTrue(
+                "Segment marked completed to EOF must be treated as fully complete",
+                CacheCoverageVerifier.isFullyCached(cache, key, 0L, -1L)
+            )
+        } finally {
+            runCatching { cache.release() }
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `PlaybackSessionState retention window marks old segments outside 30s eligible for eviction`() {
+        val session = PlaybackSessionState(
+            sourceUri = testUri.toString(),
+            prefetchModeEnabled = true,
+        )
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { null },
+            getCache = { null },
+            getCacheDataSourceFactory = { null },
+            upstreamFactory = { throw UnsupportedOperationException() },
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // Enqueue segment 1: mediaTime 0s, duration 6s (ends at 6s)
+        val seg1 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = testUri, cacheKey = "seg1_key"),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 6_000_000L,
+            dataSpec = DataSpec(testUri),
+        )
+        coordinator.scheduler.registry[seg1.identity] = seg1
+
+        // Enqueue segment 2: mediaTime 60s, duration 6s (ends at 66s)
+        val seg2 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = testUri, cacheKey = "seg2_key"),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 60_000_000L,
+            durationUs = 6_000_000L,
+            dataSpec = DataSpec(testUri),
+        )
+        coordinator.scheduler.registry[seg2.identity] = seg2
+
+        // Simulate playback at 45 seconds (45,000,000 Us)
+        session.playbackPositionUs = 45_000_000L
+
+        // Backward retention is 30s: segments ending before 45s - 30s = 15s are ELIGIBLE for eviction!
+        // seg1 ends at 6s (< 15s) -> NOT active (eligible for eviction)
+        assertFalse(
+            "seg1 (ended at 6s) is older than 30s retention window from 45s, must be eligible for eviction",
+            session.isResourceActive("seg1_key")
+        )
+
+        // seg2 ends at 66s (> 15s) -> ACTIVE (protected)
+        assertTrue(
+            "seg2 (ends at 66s) is within the upcoming/retention window, must be protected",
+            session.isResourceActive("seg2_key")
+        )
+
+        coordinator.release()
+        session.release()
     }
 }

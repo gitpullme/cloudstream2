@@ -55,12 +55,18 @@ class PlaybackPrefetchCoordinator(
         val mediaTimeStartUs: Long,
         val mediaTimeEndUs: Long,
         val cacheKey: String,
+        val byteOffset: Long = 0L,
+        val byteLength: Long = -1L,
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var coordinatorJob: Job? = null
     private val started = AtomicBoolean(false)
     private val isReleased = AtomicBoolean(false)
+
+    @Volatile
+    var latestSnapshot: PlaybackPlayerSnapshot? = null
+        private set
 
     val scheduler = PrefetchRequestScheduler(
         context = context,
@@ -129,6 +135,7 @@ class PlaybackPrefetchCoordinator(
             isLive = session.isLive,
         ) ?: return
 
+        latestSnapshot = snapshot
         if (snapshot.isEnded) return
 
         // 2. Resolve adapter if not yet initialized
@@ -208,7 +215,7 @@ class PlaybackPrefetchCoordinator(
 
     /**
      * Calculates the dynamic byte budget available for prefetching based on user limit,
-     * cache occupancy, device free space, and active worker reservations.
+     * cache occupancy, device free space, active worker reservations, and rolling reclaimable bytes.
      */
     fun computeAvailablePrefetchBudget(): Long {
         val limitBytes = if (session.prefetchLimitBytes > 0L) {
@@ -219,18 +226,41 @@ class PlaybackPrefetchCoordinator(
 
         val currentUsage = PlaybackCacheManager.usageBytes()
         val reserved = scheduler.reservedBytes.get()
+        val reclaimable = PlaybackCacheManager.reclaimableBytes(session, latestSnapshot)
 
         val freeDisk = runCatching {
             StatFs(context.cacheDir.absolutePath).availableBytes
         }.getOrDefault(0L)
         val freeDiskUsable = maxOf(0L, freeDisk - PrefetchRequestScheduler.MIN_DISK_RESERVE_BYTES)
 
-        val cacheHeadroom = maxOf(0L, limitBytes - currentUsage - reserved)
+        val cacheHeadroom = if (limitBytes > 0L) {
+            maxOf(0L, (limitBytes - currentUsage) + reclaimable - reserved)
+        } else {
+            Long.MAX_VALUE
+        }
         return minOf(cacheHeadroom, freeDiskUsable)
     }
 
     /**
-     * Refreshes completed ranges from SimpleCache and computes contiguous coverage.
+     * Registers a completed prefetch request to immediately extend coverage if verified.
+     */
+    fun registerCompletedRequest(request: PrefetchRequest) {
+        if (!request.isInit && request.durationUs > 0L) {
+            completedRanges += PrefetchCoverageRange(
+                mediaTimeStartUs = request.mediaTimeUs,
+                mediaTimeEndUs = request.mediaTimeUs + request.durationUs,
+                cacheKey = request.identity.cacheKey,
+                byteOffset = request.identity.position,
+                byteLength = request.identity.length,
+            )
+            latestSnapshot?.let { snapshot ->
+                updateCoverage(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
+            }
+        }
+    }
+
+    /**
+     * Refreshes completed ranges from SimpleCache, prunes evicted ranges, and computes contiguous coverage.
      */
     private fun refreshCompletedCoverage(snapshot: PlaybackPlayerSnapshot) {
         val cache = getCache() ?: return
@@ -238,15 +268,21 @@ class PlaybackPrefetchCoordinator(
         // Verify completed requests in registry
         for ((identity, request) in scheduler.registry) {
             if (!request.isInit && request.durationUs > 0L) {
-                val len = if (identity.length > 0) identity.length else 1L
-                if (cache.isCached(identity.cacheKey, identity.position, len)) {
+                if (CacheCoverageVerifier.isFullyCached(cache, identity.cacheKey, identity.position, identity.length)) {
                     completedRanges += PrefetchCoverageRange(
                         mediaTimeStartUs = request.mediaTimeUs,
                         mediaTimeEndUs = request.mediaTimeUs + request.durationUs,
                         cacheKey = identity.cacheKey,
+                        byteOffset = identity.position,
+                        byteLength = identity.length,
                     )
                 }
             }
+        }
+
+        // Prune ranges that are no longer fully cached (e.g. evicted old spans)
+        completedRanges.removeIf { range ->
+            !CacheCoverageVerifier.isFullyCached(cache, range.cacheKey, range.byteOffset, range.byteLength)
         }
 
         updateCoverage(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
@@ -322,6 +358,7 @@ class PlaybackPrefetchCoordinator(
                 "Source=$safeUri " +
                 "Cache=${PlaybackCacheManager.usageBytes() / (1024 * 1024)}MB / " +
                 "Limit=${session.prefetchLimitBytes / (1024 * 1024)}MB " +
+                "Reclaimable=${PlaybackCacheManager.reclaimableBytes(session, snapshot) / (1024 * 1024)}MB " +
                 "AvailableBudget=${availableBudgetBytes / (1024 * 1024)}MB " +
                 "FreeDisk=${freeDisk / (1024 * 1024)}MB " +
                 "Workers=${scheduler.getActiveWorkerCount()}/${scheduler.getTargetWorkers()} " +
