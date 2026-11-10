@@ -1,6 +1,7 @@
 package com.lagradost.cloudstream3.ui.player
 
 import android.net.Uri
+import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
@@ -511,5 +512,494 @@ class PlaybackPrefetchIntegrationTest {
 
         coordinator.release()
         session.release()
+    }
+
+    private class KillableUpstreamDataSource(
+        val dataMap: Map<Uri, ByteArray>,
+    ) : DataSource {
+        val openCount = AtomicInteger(0)
+        @Volatile var isNetworkDead = false
+        private var inputStream: ByteArrayInputStream? = null
+        private var currentSpec: DataSpec? = null
+
+        override fun addTransferListener(transferListener: TransferListener) = Unit
+
+        override fun open(dataSpec: DataSpec): Long {
+            if (isNetworkDead) {
+                throw IOException("Simulated network outage: internet disconnected!")
+            }
+            openCount.incrementAndGet()
+            currentSpec = dataSpec
+            val data = dataMap[dataSpec.uri] ?: throw IOException("URI not found in fake server: ${dataSpec.uri}")
+            val offset = dataSpec.position.toInt()
+            val length = if (dataSpec.length != -1L) dataSpec.length.toInt() else (data.size - offset)
+            inputStream = ByteArrayInputStream(data, offset, length)
+            return length.toLong()
+        }
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (isNetworkDead) {
+                throw IOException("Simulated network outage: internet disconnected!")
+            }
+            val stream = inputStream ?: throw IOException("read() called before open()")
+            return stream.read(buffer, offset, length)
+        }
+
+        override fun getUri(): Uri? = currentSpec?.uri
+        override fun close() {
+            inputStream?.close()
+            inputStream = null
+            currentSpec = null
+        }
+    }
+
+    @Test
+    fun `critical offline playback test - HLS dual-track audio and video - both tracks and AES key prefetched, network dead, playback plays completely offline`() = runBlocking {
+        val keyUri = Uri.parse("https://cdn.example.com/hls/key.bin")
+        val videoUri = Uri.parse("https://cdn.example.com/hls/video_001.ts")
+        val audioUri = Uri.parse("https://cdn.example.com/hls/audio_001.aac")
+
+        val keyBytes = ByteArray(16) { 0x5A }
+        val videoBytes = "HLS_VIDEO_ENCRYPTED_STREAM_PAYLOAD_CHUNK_1".toByteArray(Charsets.UTF_8)
+        val audioBytes = "HLS_AUDIO_ENCRYPTED_STREAM_PAYLOAD_CHUNK_1".toByteArray(Charsets.UTF_8)
+
+        val dataMap = mapOf(
+            keyUri to keyBytes,
+            videoUri to videoBytes,
+            audioUri to audioBytes,
+        )
+
+        val upstream = KillableUpstreamDataSource(dataMap)
+        val upstreamFactory = DataSource.Factory { upstream }
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory { it.key ?: it.uri.toString() }
+        }
+
+        val session = PlaybackSessionState(
+            sourceUri = "https://cdn.example.com/hls/master.m3u8",
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 20L * 1024L * 1024L,
+        )
+
+        var reportedCoverageMs = -1L
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        ).apply {
+            onPrefetchCoverageChanged = { ms -> reportedCoverageMs = ms }
+        }
+        session.prefetchCoordinator = coordinator
+
+        // 1. Prefetch AES-128 key (isInit = true)
+        val keyReq = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = keyUri, cacheKey = keyUri.toString(), length = keyBytes.size.toLong()),
+            priority = PrefetchRequest.Priority.IMMEDIATE,
+            mediaTimeUs = 0L,
+            durationUs = 0L,
+            isInit = true,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = DataSpec(keyUri, 0, keyBytes.size.toLong()),
+        )
+        val wKey = CacheWriter(cacheDataSourceFactory.createDataSource(), keyReq.dataSpec, ByteArray(1024), null)
+        wKey.cache()
+        CacheCoverageVerifier.markCompleted(keyReq.identity.cacheKey)
+        coordinator.scheduler.registry[keyReq.identity] = keyReq
+        keyReq.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(keyReq)
+
+        // 2. Prefetch Video Chunk (0..6s)
+        val videoReq = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = videoUri, cacheKey = videoUri.toString(), length = videoBytes.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 6_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = DataSpec(videoUri, 0, videoBytes.size.toLong()),
+        )
+        val wVid = CacheWriter(cacheDataSourceFactory.createDataSource(), videoReq.dataSpec, ByteArray(1024), null)
+        wVid.cache()
+        CacheCoverageVerifier.markCompleted(videoReq.identity.cacheKey)
+        coordinator.scheduler.registry[videoReq.identity] = videoReq
+        videoReq.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(videoReq)
+
+        // 3. Prefetch Audio Chunk (0..6s)
+        val audioReq = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = audioUri, cacheKey = audioUri.toString(), length = audioBytes.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 6_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_AUDIO,
+            dataSpec = DataSpec(audioUri, 0, audioBytes.size.toLong()),
+        )
+        val wAud = CacheWriter(cacheDataSourceFactory.createDataSource(), audioReq.dataSpec, ByteArray(1024), null)
+        wAud.cache()
+        CacheCoverageVerifier.markCompleted(audioReq.identity.cacheKey)
+        coordinator.scheduler.registry[audioReq.identity] = audioReq
+        audioReq.status = PrefetchRequest.Status.COMPLETED
+        coordinator.registerCompletedRequest(audioReq)
+
+        // Verify all 3 components are in cache
+        assertTrue(CacheCoverageVerifier.isFullyCached(simpleCache, keyReq.identity.cacheKey, 0, keyBytes.size.toLong()))
+        assertTrue(CacheCoverageVerifier.isFullyCached(simpleCache, videoReq.identity.cacheKey, 0, videoBytes.size.toLong()))
+        assertTrue(CacheCoverageVerifier.isFullyCached(simpleCache, audioReq.identity.cacheKey, 0, audioBytes.size.toLong()))
+
+        val opensBeforeNetworkCut = upstream.openCount.get()
+        assertTrue(opensBeforeNetworkCut >= 3)
+
+        // 4. CUT THE INTERNET (simulating user turning off Wi-Fi/cellular)
+        upstream.isNetworkDead = true
+
+        // 5. Media3 playback demuxer & decoders now request key, video, and audio chunks
+        val playbackDs = cacheDataSourceFactory.createDataSource()
+
+        // Read key
+        val keyBuf = ByteArray(keyBytes.size)
+        playbackDs.open(DataSpec(keyUri))
+        playbackDs.read(keyBuf, 0, keyBuf.size)
+        playbackDs.close()
+        assertArrayEquals(keyBytes, keyBuf)
+
+        // Read video segment
+        val vidBuf = ByteArray(videoBytes.size)
+        playbackDs.open(DataSpec(videoUri))
+        playbackDs.read(vidBuf, 0, vidBuf.size)
+        playbackDs.close()
+        assertArrayEquals(videoBytes, vidBuf)
+
+        // Read audio segment
+        val audBuf = ByteArray(audioBytes.size)
+        playbackDs.open(DataSpec(audioUri))
+        playbackDs.read(audBuf, 0, audBuf.size)
+        playbackDs.close()
+        assertArrayEquals(audioBytes, audBuf)
+
+        // Zero additional network requests occurred while internet was dead!
+        assertEquals("No network requests must be issued during offline playback of prefetched range",
+            opensBeforeNetworkCut, upstream.openCount.get())
+
+        coordinator.release()
+        session.release()
+    }
+
+    @Test
+    fun `offline playability guarantee - missing audio stops prefetch indicator at audio boundary`() = runBlocking {
+        val videoUri1 = Uri.parse("https://cdn.example.com/hls/v1.ts")
+        val videoUri2 = Uri.parse("https://cdn.example.com/hls/v2.ts")
+        val audioUri1 = Uri.parse("https://cdn.example.com/hls/a1.aac")
+
+        val v1Bytes = "VIDEO_PART_1".toByteArray()
+        val v2Bytes = "VIDEO_PART_2".toByteArray()
+        val a1Bytes = "AUDIO_PART_1".toByteArray()
+
+        val dataMap = mapOf(
+            videoUri1 to v1Bytes,
+            videoUri2 to v2Bytes,
+            audioUri1 to a1Bytes,
+        )
+
+        val upstream = KillableUpstreamDataSource(dataMap)
+        val upstreamFactory = DataSource.Factory { upstream }
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory { it.key ?: it.uri.toString() }
+        }
+
+        val session = PlaybackSessionState(
+            sourceUri = "https://cdn.example.com/hls/master.m3u8",
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 20L * 1024L * 1024L,
+        )
+
+        var reportedCoverageMs = -1L
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        ).apply {
+            onPrefetchCoverageChanged = { ms -> reportedCoverageMs = ms }
+        }
+        session.prefetchCoordinator = coordinator
+
+        // Fake active adapter with separate audio
+        val fakeAdapter = object : PrefetchAdapter {
+            override val name: String = "HLS Fake Dual Track"
+            override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean = true
+            override suspend fun getUpcomingRequests(snapshot: PlaybackPlayerSnapshot, availableBudgetBytes: Long): List<PrefetchRequest> = emptyList()
+            override fun hasSeparateAudioTrack(): Boolean = true
+        }
+        coordinator.activeAdapter = fakeAdapter
+
+        // Video chunk 1 (0..10s)
+        val reqV1 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = videoUri1, cacheKey = videoUri1.toString(), length = v1Bytes.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 10_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = DataSpec(videoUri1, 0, v1Bytes.size.toLong()),
+        )
+        val wV1 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqV1.dataSpec, ByteArray(1024), null)
+        wV1.cache()
+        CacheCoverageVerifier.markCompleted(reqV1.identity.cacheKey)
+        coordinator.scheduler.registry[reqV1.identity] = reqV1
+        coordinator.registerCompletedRequest(reqV1)
+
+        // Video chunk 2 (10..20s)
+        val reqV2 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = videoUri2, cacheKey = videoUri2.toString(), length = v2Bytes.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 10_000_000L,
+            durationUs = 10_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = DataSpec(videoUri2, 0, v2Bytes.size.toLong()),
+        )
+        val wV2 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqV2.dataSpec, ByteArray(1024), null)
+        wV2.cache()
+        CacheCoverageVerifier.markCompleted(reqV2.identity.cacheKey)
+        coordinator.scheduler.registry[reqV2.identity] = reqV2
+        coordinator.registerCompletedRequest(reqV2)
+
+        // Audio chunk 1 ONLY (0..10s) - audio chunk 2 is missing!
+        val reqA1 = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = audioUri1, cacheKey = audioUri1.toString(), length = a1Bytes.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 10_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_AUDIO,
+            dataSpec = DataSpec(audioUri1, 0, a1Bytes.size.toLong()),
+        )
+        val wA1 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqA1.dataSpec, ByteArray(1024), null)
+        wA1.cache()
+        CacheCoverageVerifier.markCompleted(reqA1.identity.cacheKey)
+        coordinator.scheduler.registry[reqA1.identity] = reqA1
+        coordinator.registerCompletedRequest(reqA1)
+
+        val snap = PlaybackPlayerSnapshot(
+            currentPositionMs = 0L,
+            bufferedPositionMs = 0L,
+            durationMs = 60_000L,
+            playbackState = androidx.media3.common.Player.STATE_READY,
+            isPlaying = true,
+            playWhenReady = true,
+            playbackSpeed = 1.0f,
+            currentManifest = null,
+            sourceUri = session.sourceUri?.let { Uri.parse(it) },
+            selectedMime = null,
+            isLive = false,
+            currentTracks = null,
+        )
+
+        val refreshMethod = PlaybackPrefetchCoordinator::class.java.getDeclaredMethod("refreshCompletedCoverage", PlaybackPlayerSnapshot::class.java)
+        refreshMethod.isAccessible = true
+        refreshMethod.invoke(coordinator, snap)
+
+        // Offline playable position MUST be constrained to 10s (min of video 20s and audio 10s), NOT 20s!
+        assertEquals("Offline playable indicator must be constrained by audio boundary", 10_000L, coordinator.lastReportedCoverageMs)
+
+        coordinator.release()
+        session.release()
+    }
+
+    @Test
+    fun `critical offline playback test - MP4 container header and media chunk - offline playback succeeds without network`() = runBlocking {
+        val mp4Uri = Uri.parse("https://cdn.example.com/video.mp4")
+        val containerHeader = ByteArray(4096) { 0x01 } // 0..4096: ftyp + moov
+        val sampleChunk = ByteArray(1024 * 64) { 0x02 } // 4096..69632: mdat media samples
+
+        val fullFile = ByteArray(containerHeader.size + sampleChunk.size)
+        System.arraycopy(containerHeader, 0, fullFile, 0, containerHeader.size)
+        System.arraycopy(sampleChunk, 0, fullFile, containerHeader.size, sampleChunk.size)
+
+        val upstream = KillableUpstreamDataSource(mapOf(mp4Uri to fullFile))
+        val upstreamFactory = DataSource.Factory { upstream }
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory { it.key ?: it.uri.toString() }
+        }
+
+        val session = PlaybackSessionState(
+            sourceUri = mp4Uri.toString(),
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 20L * 1024L * 1024L,
+        )
+
+        val coordinator = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = session,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        session.prefetchCoordinator = coordinator
+
+        // 1. Prefetch container header (0..4096, isInit = true)
+        val initSpec = DataSpec.Builder().setUri(mp4Uri).setPosition(0L).setLength(4096L).build()
+        val initReq = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = mp4Uri, cacheKey = mp4Uri.toString(), position = 0L, length = 4096L),
+            priority = PrefetchRequest.Priority.IMMEDIATE,
+            mediaTimeUs = 0L,
+            durationUs = 0L,
+            isInit = true,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = initSpec,
+        )
+        val wInit = CacheWriter(cacheDataSourceFactory.createDataSource(), initReq.dataSpec, ByteArray(1024), null)
+        wInit.cache()
+        coordinator.scheduler.registry[initReq.identity] = initReq
+        coordinator.registerCompletedRequest(initReq)
+
+        // 2. Prefetch sample chunk (4096..69632)
+        val chunkSpec = DataSpec.Builder().setUri(mp4Uri).setPosition(4096L).setLength(sampleChunk.size.toLong()).build()
+        val chunkReq = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = mp4Uri, cacheKey = mp4Uri.toString(), position = 4096L, length = sampleChunk.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 2_000_000L,
+            isInit = false,
+            trackType = C.TRACK_TYPE_VIDEO,
+            dataSpec = chunkSpec,
+        )
+        val wChunk = CacheWriter(cacheDataSourceFactory.createDataSource(), chunkReq.dataSpec, ByteArray(1024), null)
+        wChunk.cache()
+        coordinator.scheduler.registry[chunkReq.identity] = chunkReq
+        coordinator.registerCompletedRequest(chunkReq)
+
+        assertTrue(simpleCache.isCached(mp4Uri.toString(), 0L, 4096L))
+        assertTrue(simpleCache.isCached(mp4Uri.toString(), 4096L, sampleChunk.size.toLong()))
+
+        val opensBeforeCut = upstream.openCount.get()
+
+        // 3. CUT THE INTERNET
+        upstream.isNetworkDead = true
+
+        // 4. Media3 Mp4Extractor opens container header and samples offline
+        val playbackDs = cacheDataSourceFactory.createDataSource()
+
+        // Read header
+        val headerBuf = ByteArray(4096)
+        playbackDs.open(DataSpec(mp4Uri, 0L, 4096L))
+        playbackDs.read(headerBuf, 0, headerBuf.size)
+        playbackDs.close()
+        assertArrayEquals(containerHeader, headerBuf)
+
+        // Read samples
+        val sampleBuf = ByteArray(sampleChunk.size)
+        playbackDs.open(DataSpec(mp4Uri, 4096L, sampleChunk.size.toLong()))
+        playbackDs.read(sampleBuf, 0, sampleBuf.size)
+        playbackDs.close()
+        assertArrayEquals(sampleChunk, sampleBuf)
+
+        // Zero upstream requests while internet was disconnected
+        assertEquals("Offline MP4 playback must not touch network", opensBeforeCut, upstream.openCount.get())
+
+        coordinator.release()
+        session.release()
+    }
+
+    @Test
+    fun `session recovery test - stream change releases session A cleanly and stream B starts prefetching without getting stuck`() = runBlocking {
+        val streamAUri = Uri.parse("https://cdn.example.com/streamA/seg1.ts")
+        val streamBUri = Uri.parse("https://cdn.example.com/streamB/seg1.ts")
+
+        val dataA = ByteArray(1024 * 1024) { 0x0A }
+        val dataB = ByteArray(1024 * 1024) { 0x0B }
+
+        val upstream = KillableUpstreamDataSource(mapOf(streamAUri to dataA, streamBUri to dataB))
+        val upstreamFactory = DataSource.Factory { upstream }
+        val cacheDataSourceFactory = CacheDataSource.Factory().apply {
+            setCache(simpleCache)
+            setUpstreamDataSourceFactory(upstreamFactory)
+            setCacheKeyFactory { it.key ?: it.uri.toString() }
+        }
+
+        // Stream A starts
+        val sessionA = PlaybackSessionState(
+            sourceUri = streamAUri.toString(),
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 2L * 1024L * 1024L,
+        )
+        val coordinatorA = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = sessionA,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        sessionA.prefetchCoordinator = coordinatorA
+
+        val reqA = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = streamAUri, cacheKey = streamAUri.toString(), length = dataA.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 5_000_000L,
+            dataSpec = DataSpec(streamAUri, 0, dataA.size.toLong()),
+        )
+        val wA = CacheWriter(cacheDataSourceFactory.createDataSource(), reqA.dataSpec, ByteArray(1024), null)
+        wA.cache()
+        coordinatorA.scheduler.registry[reqA.identity] = reqA
+        coordinatorA.registerCompletedRequest(reqA)
+        assertTrue(simpleCache.isCached(streamAUri.toString(), 0L, dataA.size.toLong()))
+
+        // Stream change happens: release session A cleanly
+        sessionA.release()
+        assertEquals(PlaybackSessionState.Lifecycle.RELEASED, sessionA.lifecycle)
+
+        // Stream B starts
+        val sessionB = PlaybackSessionState(
+            sourceUri = streamBUri.toString(),
+            prefetchModeEnabled = true,
+            prefetchLimitBytes = 2L * 1024L * 1024L,
+        )
+        val coordinatorB = PlaybackPrefetchCoordinator(
+            context = android.app.Application(),
+            session = sessionB,
+            playerProvider = { null },
+            getCache = { simpleCache },
+            getCacheDataSourceFactory = { cacheDataSourceFactory },
+            upstreamFactory = upstreamFactory,
+            cacheKeyFactory = { it.key ?: it.uri.toString() },
+        )
+        sessionB.prefetchCoordinator = coordinatorB
+
+        val reqB = PrefetchRequest(
+            identity = PrefetchRequestIdentity(uri = streamBUri, cacheKey = streamBUri.toString(), length = dataB.size.toLong()),
+            priority = PrefetchRequest.Priority.NEXT_MEDIA,
+            mediaTimeUs = 0L,
+            durationUs = 5_000_000L,
+            dataSpec = DataSpec(streamBUri, 0, dataB.size.toLong()),
+        )
+        val wB = CacheWriter(cacheDataSourceFactory.createDataSource(), reqB.dataSpec, ByteArray(1024), null)
+        wB.cache()
+        coordinatorB.scheduler.registry[reqB.identity] = reqB
+        coordinatorB.registerCompletedRequest(reqB)
+
+        // Stream B prefetched successfully without getting stuck!
+        assertTrue(simpleCache.isCached(streamBUri.toString(), 0L, dataB.size.toLong()))
+
+        coordinatorB.release()
+        sessionB.release()
     }
 }

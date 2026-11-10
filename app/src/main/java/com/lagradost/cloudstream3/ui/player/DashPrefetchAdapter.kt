@@ -22,6 +22,9 @@ class DashPrefetchAdapter(
 
     override val name: String = "DASH"
 
+    private var hasSeparateAudio: Boolean = false
+    override fun hasSeparateAudioTrack(): Boolean = hasSeparateAudio
+
     companion object {
         private const val NEAR_PLAYHEAD_US = 15_000_000L
         private const val FORWARD_RUNWAY_US = 60_000_000L
@@ -40,6 +43,10 @@ class DashPrefetchAdapter(
     ): List<PrefetchRequest> {
         val manifest = snapshot.currentManifest as? DashManifest ?: return emptyList()
         if (availableBudgetBytes <= 0L) return emptyList()
+
+        hasSeparateAudio = (0 until manifest.periodCount).any { p ->
+            manifest.getPeriod(p).adaptationSets.any { it.type == C.TRACK_TYPE_AUDIO }
+        }
 
         val isDynamic = manifest.dynamic
         val prefetchStartUs = maxOf(snapshot.currentPositionUs, snapshot.bufferedPositionUs)

@@ -5,29 +5,48 @@ import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.UriUtil
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSourceInputStream
 import androidx.media3.datasource.DataSpec
 import androidx.media3.exoplayer.hls.HlsManifest
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
+import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
+import androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Robust HLS VOD and sliding-window live segment prefetch adapter.
  * Uses immutable player snapshots to extract the active media playlist without thread violations.
+ * Handles dual-track audio/video prefetching, initialization segments (EXT-X-MAP), and AES-128 encryption keys.
  */
 @OptIn(UnstableApi::class)
 class HlsPrefetchAdapter(
     val defaultHeaders: Map<String, String> = emptyMap(),
+    val upstreamFactory: DataSource.Factory? = null,
     val cacheKeyFactory: (DataSpec) -> String,
 ) : PrefetchAdapter {
 
     override val name: String = "HLS"
 
+    private var hasSeparateAudio: Boolean = false
+    private val cachedAudioPlaylists = ConcurrentHashMap<Uri, HlsMediaPlaylist>()
+
+    override fun hasSeparateAudioTrack(): Boolean = hasSeparateAudio
+
+    internal fun setAudioPlaylistForTesting(uri: Uri, playlist: HlsMediaPlaylist) {
+        cachedAudioPlaylists[uri] = playlist
+        hasSeparateAudio = true
+    }
+
     companion object {
         private const val TAG = "HlsPrefetch"
         private const val NEAR_PLAYHEAD_US = 15_000_000L // 15s
         private const val FORWARD_RUNWAY_US = 60_000_000L // 60s
-        private const val DEFAULT_SEGMENT_BYTES_ESTIMATE = 1024L * 1024L // 1 MB fallback
     }
 
     override suspend fun isSupported(sourceUri: Uri, mimeType: String?, manifest: Any?): Boolean {
@@ -49,10 +68,10 @@ class HlsPrefetchAdapter(
 
         if (availableBudgetBytes <= 0L) return emptyList()
 
+        val multivariant = (snapshot.currentManifest as? HlsManifest)?.multivariantPlaylist
         val isVod = mediaPlaylist.hasEndTag ||
             mediaPlaylist.playlistType == HlsMediaPlaylist.PLAYLIST_TYPE_VOD
 
-        // Prefetch starts after the currently buffered position to avoid re-requesting buffered media
         val prefetchStartUs = maxOf(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
         val requests = mutableListOf<PrefetchRequest>()
         val baseUri = mediaPlaylist.baseUri
@@ -67,7 +86,7 @@ class HlsPrefetchAdapter(
 
         var scheduledBytes = 0L
 
-        // 1. Initialization Segment
+        // 1. Video Initialization Segment (EXT-X-MAP)
         val firstSegment = mediaPlaylist.segments.firstOrNull()
         firstSegment?.initializationSegment?.let { initSeg ->
             val initUri = UriUtil.resolveToUri(baseUri, initSeg.url)
@@ -94,12 +113,10 @@ class HlsPrefetchAdapter(
             )
         }
 
-        // 2. Media Segments
-        // Determine timeline offset between playlist segments and player presentation window
+        // 2. Video Media Segments & Encryption Keys
         val timelineOffsetUs = if (isVod) {
             0L
         } else {
-            // For live/sliding playlist, segment.relativeStartTimeUs is relative to current snapshot start
             if (snapshot.windowPositionInPeriodUs > 0L && mediaPlaylist.startTimeUs > 0L && !mediaPlaylist.hasProgramDateTime) {
                 mediaPlaylist.startTimeUs - snapshot.windowPositionInPeriodUs
             } else {
@@ -111,12 +128,13 @@ class HlsPrefetchAdapter(
         var firstScheduledUs: Long? = null
         var upcomingCount = 0
 
+        val scheduledVideoKeys = mutableSetOf<String>()
+
         for (segment in mediaPlaylist.segments) {
             val segmentPresentationStartUs = segment.relativeStartTimeUs + timelineOffsetUs
             val segmentDurationUs = segment.durationUs
             val segmentPresentationEndUs = segmentPresentationStartUs + segmentDurationUs
 
-            // For live streams, constrain prefetch to at most 3 segments beyond the playhead
             if (!isVod && segmentPresentationStartUs > snapshot.currentPositionUs) {
                 if (liveSegmentsScheduled >= 3) break
             }
@@ -126,6 +144,27 @@ class HlsPrefetchAdapter(
                     firstScheduledUs = segmentPresentationStartUs
                 }
                 upcomingCount++
+
+                // Schedule segment AES-128 encryption key if present and not yet scheduled
+                segment.fullSegmentEncryptionKeyUri?.let { rawKeyUri ->
+                    if (scheduledVideoKeys.add(rawKeyUri)) {
+                        val keyUri = UriUtil.resolveToUri(baseUri, rawKeyUri)
+                        val keySpec = DataSpec.Builder()
+                            .setUri(keyUri)
+                            .setHttpRequestHeaders(defaultHeaders)
+                            .build()
+                        val keyIdentity = PrefetchRequestIdentity.fromDataSpec(keySpec, cacheKeyFactory, defaultHeaders)
+                        requests += PrefetchRequest(
+                            identity = keyIdentity,
+                            priority = PrefetchRequest.Priority.IMMEDIATE,
+                            mediaTimeUs = segmentPresentationStartUs,
+                            durationUs = 0L,
+                            isInit = true,
+                            trackType = C.TRACK_TYPE_VIDEO,
+                            dataSpec = keySpec,
+                        )
+                    }
+                }
 
                 val segUri = UriUtil.resolveToUri(baseUri, segment.url)
                 val segLength = if (segment.byteRangeLength > 0) segment.byteRangeLength else C.LENGTH_UNSET.toLong()
@@ -142,7 +181,6 @@ class HlsPrefetchAdapter(
                     maxOf(256 * 1024L, (segmentDurationUs * estimatedBitrate) / 8_000_000L)
                 }
 
-                // Check budget limit
                 if (scheduledBytes + estBytes > availableBudgetBytes) {
                     break
                 }
@@ -171,9 +209,153 @@ class HlsPrefetchAdapter(
             }
         }
 
+        // 3. Audio Rendition Segments & Encryption Keys (Separate Audio Renditions)
+        val audioRenditions = multivariant?.audios.orEmpty()
+        val audioRendition = resolveSelectedAudioRendition(audioRenditions, snapshot.currentTracks)
+        val audioPlaylist = audioRendition?.url?.let { fetchAudioPlaylist(it) }
+        hasSeparateAudio = audioPlaylist != null
+
+        if (audioPlaylist != null) {
+            val audioBaseUri = audioPlaylist.baseUri
+            // Audio init segment
+            audioPlaylist.segments.firstOrNull()?.initializationSegment?.let { audioInit ->
+                val initUri = UriUtil.resolveToUri(audioBaseUri, audioInit.url)
+                val initLength = if (audioInit.byteRangeLength > 0) audioInit.byteRangeLength else C.LENGTH_UNSET.toLong()
+                val initSpec = DataSpec.Builder()
+                    .setUri(initUri)
+                    .setPosition(audioInit.byteRangeOffset)
+                    .setLength(initLength)
+                    .setHttpRequestHeaders(defaultHeaders)
+                    .build()
+                val initIdentity = PrefetchRequestIdentity.fromDataSpec(initSpec, cacheKeyFactory, defaultHeaders)
+                requests += PrefetchRequest(
+                    identity = initIdentity,
+                    priority = PrefetchRequest.Priority.IMMEDIATE,
+                    mediaTimeUs = 0L,
+                    durationUs = 0L,
+                    isInit = true,
+                    trackType = C.TRACK_TYPE_AUDIO,
+                    dataSpec = initSpec,
+                )
+            }
+
+            val scheduledAudioKeys = mutableSetOf<String>()
+            for (audioSeg in audioPlaylist.segments) {
+                val segStartUs = audioSeg.relativeStartTimeUs + timelineOffsetUs
+                val segDurationUs = audioSeg.durationUs
+                val segEndUs = segStartUs + segDurationUs
+
+                if (segEndUs > prefetchStartUs) {
+                    audioSeg.fullSegmentEncryptionKeyUri?.let { rawKeyUri ->
+                        if (scheduledAudioKeys.add(rawKeyUri)) {
+                            val keyUri = UriUtil.resolveToUri(audioBaseUri, rawKeyUri)
+                            val keySpec = DataSpec.Builder()
+                                .setUri(keyUri)
+                                .setHttpRequestHeaders(defaultHeaders)
+                                .build()
+                            val keyIdentity = PrefetchRequestIdentity.fromDataSpec(keySpec, cacheKeyFactory, defaultHeaders)
+                            requests += PrefetchRequest(
+                                identity = keyIdentity,
+                                priority = PrefetchRequest.Priority.IMMEDIATE,
+                                mediaTimeUs = segStartUs,
+                                durationUs = 0L,
+                                isInit = true,
+                                trackType = C.TRACK_TYPE_AUDIO,
+                                dataSpec = keySpec,
+                            )
+                        }
+                    }
+
+                    val segUri = UriUtil.resolveToUri(audioBaseUri, audioSeg.url)
+                    val segLength = if (audioSeg.byteRangeLength > 0) audioSeg.byteRangeLength else C.LENGTH_UNSET.toLong()
+                    val spec = DataSpec.Builder()
+                        .setUri(segUri)
+                        .setPosition(audioSeg.byteRangeOffset)
+                        .setLength(segLength)
+                        .setHttpRequestHeaders(defaultHeaders)
+                        .build()
+
+                    val estAudioBytes = if (segLength > 0) segLength else 64 * 1024L
+                    if (scheduledBytes + estAudioBytes > availableBudgetBytes) break
+                    scheduledBytes += estAudioBytes
+
+                    val identity = PrefetchRequestIdentity.fromDataSpec(spec, cacheKeyFactory, defaultHeaders)
+                    val priority = when {
+                        segStartUs <= prefetchStartUs + NEAR_PLAYHEAD_US -> PrefetchRequest.Priority.NEXT_MEDIA
+                        segStartUs <= prefetchStartUs + FORWARD_RUNWAY_US -> PrefetchRequest.Priority.FORWARD_MEDIA
+                        else -> PrefetchRequest.Priority.USEFUL_PREFETCH
+                    }
+
+                    requests += PrefetchRequest(
+                        identity = identity,
+                        priority = priority,
+                        mediaTimeUs = segStartUs,
+                        durationUs = segDurationUs,
+                        isInit = false,
+                        trackType = C.TRACK_TYPE_AUDIO,
+                        dataSpec = spec,
+                    )
+                }
+            }
+        }
+
         maybeLogDiagnostics(mediaPlaylist, snapshot, upcomingCount, firstScheduledUs)
 
-        return requests
+        // Sort requests: init requests first, then by presentation time so audio and video stay in sync
+        return requests.sortedWith(
+            compareBy<PrefetchRequest> { !it.isInit }
+                .thenBy { it.mediaTimeUs }
+        )
+    }
+
+    private fun resolveSelectedAudioRendition(
+        audios: List<HlsMultivariantPlaylist.Rendition>,
+        currentTracks: Tracks?,
+    ): HlsMultivariantPlaylist.Rendition? {
+        if (audios.isEmpty()) return null
+        if (currentTracks != null) {
+            for (group in currentTracks.groups) {
+                if (group.type == C.TRACK_TYPE_AUDIO && group.isSelected) {
+                    for (i in 0 until group.length) {
+                        if (group.isTrackSelected(i)) {
+                            val format = group.getTrackFormat(i)
+                            val match = audios.firstOrNull { rendition ->
+                                (format.id != null && rendition.format.id == format.id) ||
+                                (format.label != null && rendition.name.equals(format.label, ignoreCase = true)) ||
+                                (format.language != null && rendition.format.language.equals(format.language, ignoreCase = true))
+                            }
+                            if (match != null) return match
+                        }
+                    }
+                }
+            }
+        }
+        return audios.firstOrNull { it.url != null }
+    }
+
+    private suspend fun fetchAudioPlaylist(audioUri: Uri): HlsMediaPlaylist? = withContext(Dispatchers.IO) {
+        cachedAudioPlaylists[audioUri]?.let { return@withContext it }
+        val factory = upstreamFactory ?: return@withContext null
+        try {
+            val dataSpec = DataSpec.Builder()
+                .setUri(audioUri)
+                .setHttpRequestHeaders(defaultHeaders)
+                .build()
+            val dataSource = factory.createDataSource()
+            val inputStream = DataSourceInputStream(dataSource, dataSpec)
+            val playlist = inputStream.use { input ->
+                HlsPlaylistParser().parse(audioUri, input)
+            }
+            if (playlist is HlsMediaPlaylist) {
+                cachedAudioPlaylists[audioUri] = playlist
+                playlist
+            } else {
+                null
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to load audio playlist $audioUri: ${t.message}")
+            null
+        }
     }
 
     private var lastLogTimeMs = 0L
@@ -191,15 +373,8 @@ class HlsPrefetchAdapter(
             TAG,
             "HLS Timeline: hasProgramDateTime=${mediaPlaylist.hasProgramDateTime}, rawStartTimeUs=${mediaPlaylist.startTimeUs}, " +
                 "durationUs=${mediaPlaylist.durationUs}, playerPosMs=${snapshot.currentPositionMs}, bufferedPosMs=${snapshot.bufferedPositionMs}, " +
-                "segmentsTotal=${mediaPlaylist.segments.size}, upcomingScheduled=$upcomingCount, firstScheduledUs=$firstScheduledSegmentTimeUs"
+                "segmentsTotal=${mediaPlaylist.segments.size}, upcomingScheduled=$upcomingCount, firstScheduledUs=$firstScheduledSegmentTimeUs, " +
+                "hasSeparateAudio=$hasSeparateAudio"
         )
-
-        val playlistEndUs = mediaPlaylist.segments.lastOrNull()?.let { it.relativeStartTimeUs + it.durationUs } ?: 0L
-        if (playlistEndUs > 0L && snapshot.currentPositionUs > playlistEndUs + 30_000_000L) {
-            Log.w(
-                TAG,
-                "HLS Timeline mismatch warning: player position (${snapshot.currentPositionUs / 1000}ms) exceeds playlist segments end (${playlistEndUs / 1000}ms)"
-            )
-        }
     }
 }

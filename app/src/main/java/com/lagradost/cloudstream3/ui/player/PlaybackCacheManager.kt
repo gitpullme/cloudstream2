@@ -174,10 +174,24 @@ object PlaybackCacheManager {
 
     fun isSpanActive(key: String): Boolean {
         val now = System.currentTimeMillis()
+        var hasPrefetchSession = false
         for (session in sessions.values) {
-            if (session.isResourceActive(key, now)) {
-                return true
+            if (session.prefetchModeEnabled) {
+                hasPrefetchSession = true
+                if (session.isResourceActive(key, now)) {
+                    return true
+                }
+            } else {
+                if (session.isResourceActive(key, now)) {
+                    return true
+                }
             }
+        }
+        // When prefetch mode is active for any running session, that session's rolling media-time
+        // retention and active leases are authoritative for cache span protection. Falling back to
+        // activePrefix locks every segment of the active title forever and causes eviction deadlock.
+        if (hasPrefetchSession) {
+            return false
         }
         return evictor?.isSpanActive(key) ?: defaultIsSpanActive(key)
     }

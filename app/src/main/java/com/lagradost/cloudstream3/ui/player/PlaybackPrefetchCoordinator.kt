@@ -6,6 +6,7 @@ import android.os.StatFs
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
@@ -57,6 +58,7 @@ class PlaybackPrefetchCoordinator(
         val cacheKey: String,
         val byteOffset: Long = 0L,
         val byteLength: Long = -1L,
+        val trackType: Int = C.TRACK_TYPE_VIDEO,
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -76,13 +78,13 @@ class PlaybackPrefetchCoordinator(
         clock = clock,
     )
 
-    private var activeAdapter: PrefetchAdapter? = null
+    internal var activeAdapter: PrefetchAdapter? = null
     private var selectedAdapterName = "None"
     private var lastDiagnosticLogTimeMs = 0L
 
     // Completed coverage ranges verified in cache
     private val completedRanges = ConcurrentHashMap.newKeySet<PrefetchCoverageRange>()
-    private var lastReportedCoverageMs = -1L
+    internal var lastReportedCoverageMs = -1L
 
     /**
      * UI callback invoked on Dispatchers.Main with the contiguous prefetched media position in milliseconds.
@@ -115,6 +117,7 @@ class PlaybackPrefetchCoordinator(
     private suspend fun runCoordinatorLoop() {
         while (scope.isActive && !isReleased.get() && session.lifecycle != PlaybackSessionState.Lifecycle.RELEASED) {
             try {
+                scheduler.ensureWorkerPool()
                 scheduleUpcoming()
             } catch (t: Throwable) {
                 Log.w(TAG, "error in prefetch cycle: ${t.message}")
@@ -150,6 +153,8 @@ class PlaybackPrefetchCoordinator(
         // 3. Compute dynamic usable prefetch budget
         val availableBudgetBytes = computeAvailablePrefetchBudget()
         if (availableBudgetBytes <= 0L) {
+            PlaybackCacheManager.makeRoomForPrefetch(session, 1024 * 1024L, snapshot)
+            refreshCompletedCoverage(snapshot)
             maybeLogDiagnostics(snapshot, availableBudgetBytes, reasonStopped = "Storage/Cache limit reached")
             return
         }
@@ -173,6 +178,7 @@ class PlaybackPrefetchCoordinator(
 
         val hlsAdapter = HlsPrefetchAdapter(
             defaultHeaders = defaultHeaders,
+            upstreamFactory = upstreamFactory,
             cacheKeyFactory = cacheKeyFactory,
         )
         if (hlsAdapter.isSupported(uri, mime, manifest)) {
@@ -252,15 +258,17 @@ class PlaybackPrefetchCoordinator(
                 cacheKey = request.identity.cacheKey,
                 byteOffset = request.identity.position,
                 byteLength = request.identity.length,
+                trackType = request.trackType,
             )
             latestSnapshot?.let { snapshot ->
-                updateCoverage(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
+                updateCoverage(snapshot)
             }
         }
     }
 
     /**
-     * Refreshes completed ranges from SimpleCache, prunes evicted ranges, and computes contiguous coverage.
+     * Refreshes completed ranges from SimpleCache, prunes evicted ranges, and computes
+     * true verified OfflinePlayableCoverage across all dependencies.
      */
     private fun refreshCompletedCoverage(snapshot: PlaybackPlayerSnapshot) {
         val cache = getCache() ?: return
@@ -275,6 +283,7 @@ class PlaybackPrefetchCoordinator(
                         cacheKey = identity.cacheKey,
                         byteOffset = identity.position,
                         byteLength = identity.length,
+                        trackType = request.trackType,
                     )
                 }
             }
@@ -285,12 +294,11 @@ class PlaybackPrefetchCoordinator(
             !CacheCoverageVerifier.isFullyCached(cache, range.cacheKey, range.byteOffset, range.byteLength)
         }
 
-        updateCoverage(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
+        updateCoverage(snapshot)
     }
 
-    private fun updateCoverage(currentPositionUs: Long, bufferedPositionUs: Long) {
-        val playheadUs = maxOf(currentPositionUs, bufferedPositionUs)
-        val sorted = completedRanges
+    private fun computeContiguousSpanEnd(ranges: List<PrefetchCoverageRange>, playheadUs: Long): Long {
+        val sorted = ranges
             .filter { it.mediaTimeEndUs >= playheadUs }
             .sortedBy { it.mediaTimeStartUs }
 
@@ -299,12 +307,49 @@ class PlaybackPrefetchCoordinator(
             if (range.mediaTimeStartUs <= contiguousEndUs + CONTIGUOUS_GAP_TOLERANCE_US) {
                 contiguousEndUs = maxOf(contiguousEndUs, range.mediaTimeEndUs)
             } else {
-                // Gap detected: stop contiguous coverage indicator here
                 break
             }
         }
+        return contiguousEndUs
+    }
 
-        val coverageMs = contiguousEndUs / 1000L
+    private fun updateCoverage(snapshot: PlaybackPlayerSnapshot) {
+        updateCoverage(snapshot.currentPositionUs, snapshot.bufferedPositionUs)
+    }
+
+    private fun updateCoverage(currentPositionUs: Long, bufferedPositionUs: Long) {
+        val cache = getCache()
+        val playheadUs = maxOf(currentPositionUs, bufferedPositionUs)
+
+        // 1. Verify all scheduled initialization chunks and encryption keys are fully cached
+        val initRequests = scheduler.registry.values.filter { it.isInit }
+        val isInitVerified = cache != null && (initRequests.isEmpty() || initRequests.all { req ->
+            CacheCoverageVerifier.isFullyCached(cache, req.identity.cacheKey, req.identity.position, req.identity.length)
+        })
+
+        if (!isInitVerified && initRequests.isNotEmpty()) {
+            notifyCoverageChanged(playheadUs / 1000L)
+            return
+        }
+
+        // 2. Separate verified ranges by track
+        val videoRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_VIDEO }
+        val audioRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_AUDIO }
+
+        val contiguousVideoEndUs = computeContiguousSpanEnd(videoRanges, playheadUs)
+        val hasSeparateAudio = activeAdapter?.hasSeparateAudioTrack() == true
+
+        val offlinePlayableUs = if (hasSeparateAudio) {
+            val contiguousAudioEndUs = computeContiguousSpanEnd(audioRanges, playheadUs)
+            minOf(contiguousVideoEndUs, contiguousAudioEndUs)
+        } else {
+            contiguousVideoEndUs
+        }
+
+        notifyCoverageChanged(offlinePlayableUs / 1000L)
+    }
+
+    private fun notifyCoverageChanged(coverageMs: Long) {
         if (coverageMs != lastReportedCoverageMs) {
             lastReportedCoverageMs = coverageMs
             val listener = onPrefetchCoverageChanged

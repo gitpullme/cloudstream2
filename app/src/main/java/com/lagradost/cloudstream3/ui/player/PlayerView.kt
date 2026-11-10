@@ -286,7 +286,9 @@ class PlayerView @JvmOverloads constructor(
             // Preview bar
             val progressBar: PreviewTimeBar? = exoPlayerView?.findViewById(R.id.exo_progress)
             exoProgress = progressBar as? LivePreviewTimeBar
-            (player as? CS3IPlayer)?.onPrefetchCoverageChanged = { posMs ->
+            val cs3 = player as? CS3IPlayer
+            exoProgress?.prefetchModeEnabled = cs3?.prefetchModeEnabled == true
+            cs3?.onPrefetchCoverageChanged = { posMs ->
                 exoProgress?.setPrefetchPosition(posMs)
             }
             val previewImageView: ImageView? = exoPlayerView?.findViewById(R.id.previewImageView)

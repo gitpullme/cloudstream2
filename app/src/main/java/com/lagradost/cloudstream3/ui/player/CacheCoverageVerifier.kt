@@ -25,6 +25,10 @@ object CacheCoverageVerifier {
         completedKeys.remove(cacheKey)
     }
 
+    fun clear() {
+        completedKeys.clear()
+    }
+
     fun isFullyCached(
         cache: Cache?,
         identity: PrefetchRequestIdentity,
@@ -66,8 +70,21 @@ object CacheCoverageVerifier {
         if (completedKeys.contains(cacheKey)) {
             val spans = runCatching { cache.getCachedSpans(cacheKey) }.getOrNull()
             if (!spans.isNullOrEmpty()) {
-                val totalCached = spans.sumOf { it.length }
-                return totalCached > 0L
+                val sorted = spans.sortedBy { it.position }
+                var covered = position
+                for (s in sorted) {
+                    if (s.position <= covered) {
+                        covered = maxOf(covered, s.position + s.length)
+                    } else {
+                        break
+                    }
+                }
+                if (covered > position) {
+                    return true
+                }
+            } else {
+                // Spans were evicted: unmark completed
+                completedKeys.remove(cacheKey)
             }
         }
 

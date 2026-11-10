@@ -650,6 +650,7 @@ class CS3IPlayer : IPlayer {
         val session = activeSession
         activeSession = null
         session?.release()
+        onPrefetchCoverageChanged?.invoke(0L)
         loadControl?.release()
 
         exoPlayer = null
@@ -1121,6 +1122,13 @@ class CS3IPlayer : IPlayer {
                 ?.substringBefore('#')
                 ?.endsWith(".mpd", ignoreCase = true) == true
 
+        // Explicitly release any active session before creating a new one to prevent
+        // background workers, reservation leaks, and seekbar pollution across titles.
+        val oldSession = activeSession
+        activeSession = null
+        oldSession?.release()
+        onPrefetchCoverageChanged?.invoke(0L)
+
         val session = PlaybackSessionState(
             sourceUri = firstSourceUri,
             isLive = false,
@@ -1372,7 +1380,9 @@ class CS3IPlayer : IPlayer {
                         cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
                     ).apply {
                         onPrefetchCoverageChanged = { posMs ->
-                            this@CS3IPlayer.onPrefetchCoverageChanged?.invoke(posMs)
+                            if (activeSession === session) {
+                                this@CS3IPlayer.onPrefetchCoverageChanged?.invoke(posMs)
+                            }
                         }
                     }
                     session.prefetchCoordinator = coordinator

@@ -240,7 +240,7 @@ class PrefetchRequestScheduler(
         }
     }
 
-    private fun ensureWorkerPool() {
+    fun ensureWorkerPool() {
         if (isReleased.get()) return
         val target = targetWorkers.get()
         for (i in 0 until target) {
@@ -254,36 +254,43 @@ class PrefetchRequestScheduler(
 
     private suspend fun runWorkerLoop(workerIndex: Int) {
         while (scope.isActive && !isReleased.get() && session.lifecycle != PlaybackSessionState.Lifecycle.RELEASED) {
-            if (workerIndex >= targetWorkers.get()) {
-                break
-            }
-
-            if (isPaused.get()) {
-                delay(200)
-                continue
-            }
-
-            val request = synchronized(lock) {
-                priorityQueue.poll()
-            }
-
-            if (request == null) {
-                delay(100)
-                continue
-            }
-
-            // Check if storage capacity or disk space is full
-            if (!hasAvailableStorage(request)) {
-                synchronized(lock) {
-                    if (!request.isTerminal()) {
-                        priorityQueue.offer(request)
-                    }
+            try {
+                if (workerIndex >= targetWorkers.get()) {
+                    break
                 }
-                delay(500)
-                continue
-            }
 
-            executeRequest(request)
+                if (isPaused.get()) {
+                    delay(200)
+                    continue
+                }
+
+                val request = synchronized(lock) {
+                    priorityQueue.poll()
+                }
+
+                if (request == null) {
+                    delay(100)
+                    continue
+                }
+
+                // Check if storage capacity or disk space is full
+                if (!hasAvailableStorage(request)) {
+                    synchronized(lock) {
+                        if (!request.isTerminal()) {
+                            priorityQueue.offer(request)
+                        }
+                    }
+                    delay(500)
+                    continue
+                }
+
+                executeRequest(request)
+            } catch (c: CancellationException) {
+                break
+            } catch (t: Throwable) {
+                Log.w(TAG, "Worker $workerIndex loop caught unexpected error: ${t.message}", t)
+                delay(200)
+            }
         }
     }
 

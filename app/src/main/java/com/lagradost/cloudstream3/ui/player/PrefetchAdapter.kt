@@ -23,6 +23,12 @@ interface PrefetchAdapter {
     ): List<PrefetchRequest>
 
     /**
+     * Indicates whether the media presentation utilizes separate audio rendition streams
+     * (e.g. non-muxed HLS audio or DASH adaptation sets) that must be verified for offline playability.
+     */
+    fun hasSeparateAudioTrack(): Boolean = false
+
+    /**
      * Called when the user initiates a playback seek.
      */
     fun onSeek(newPositionUs: Long) = Unit

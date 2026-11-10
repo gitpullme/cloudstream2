@@ -16,6 +16,8 @@ import androidx.media3.exoplayer.dash.manifest.Period
 import androidx.media3.exoplayer.dash.manifest.RangedUri
 import androidx.media3.exoplayer.dash.manifest.Representation
 import androidx.media3.exoplayer.dash.manifest.SegmentBase
+import androidx.media3.exoplayer.hls.HlsManifest
+import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
 import androidx.media3.exoplayer.hls.playlist.HlsPlaylistParser
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
 import com.google.common.collect.ImmutableList
@@ -463,6 +465,108 @@ class FormatAdaptersTest {
     }
 
     @Test
+    fun `HLS adapter schedules both active video and separate audio rendition when multivariant playlist has audio rendition`() = runBlocking {
+        val masterM3u8 = """
+            #EXTM3U
+            #EXT-X-VERSION:4
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"
+            #EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="audio"
+            video.m3u8
+        """.trimIndent()
+
+        val videoM3u8 = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:6
+            #EXT-X-VERSION:4
+            #EXTINF:6.0,
+            video_0.ts
+            #EXTINF:6.0,
+            video_1.ts
+            #EXT-X-ENDLIST
+        """.trimIndent()
+
+        val audioM3u8 = """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:6
+            #EXT-X-VERSION:4
+            #EXTINF:6.0,
+            audio_0.aac
+            #EXTINF:6.0,
+            audio_1.aac
+            #EXT-X-ENDLIST
+        """.trimIndent()
+
+        val baseUri = "https://cdn.example.com/hls/"
+        val masterPlaylist = HlsPlaylistParser().parse(
+            Uri.parse(baseUri + "master.m3u8"),
+            masterM3u8.byteInputStream()
+        ) as HlsMultivariantPlaylist
+
+        val videoPlaylist = HlsPlaylistParser().parse(
+            Uri.parse(baseUri + "video.m3u8"),
+            videoM3u8.byteInputStream()
+        ) as HlsMediaPlaylist
+
+        val hlsManifest = HlsManifest::class.java.declaredConstructors[0].apply {
+            isAccessible = true
+        }.newInstance(masterPlaylist, videoPlaylist) as HlsManifest
+
+        val adapter = HlsPrefetchAdapter(
+            defaultHeaders = emptyMap(),
+            upstreamFactory = {
+                object : DataSource {
+                    var isOpened = false
+                    override fun addTransferListener(transferListener: TransferListener) = Unit
+                    override fun open(dataSpec: DataSpec): Long {
+                        isOpened = true
+                        return audioM3u8.length.toLong()
+                    }
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        if (!isOpened) return -1
+                        val bytes = audioM3u8.toByteArray()
+                        val toRead = minOf(length, bytes.size)
+                        System.arraycopy(bytes, 0, buffer, offset, toRead)
+                        isOpened = false
+                        return toRead
+                    }
+                    override fun getUri(): Uri = Uri.parse(baseUri + "audio.m3u8")
+                    override fun close() = Unit
+                }
+            },
+            cacheKeyFactory = defaultKeyFactory,
+        )
+
+        val snapshot = PlaybackPlayerSnapshot(
+            currentPositionMs = 0L,
+            bufferedPositionMs = 0L,
+            durationMs = 12_000L,
+            playbackState = Player.STATE_READY,
+            isPlaying = true,
+            playWhenReady = true,
+            playbackSpeed = 1.0f,
+            currentManifest = hlsManifest,
+            sourceUri = Uri.parse(baseUri + "master.m3u8"),
+            selectedMime = MimeTypes.APPLICATION_M3U8,
+            isLive = false,
+            currentTracks = null,
+        )
+
+        val reqs = adapter.getUpcomingRequests(snapshot, 50L * 1024L * 1024L)
+
+        assertTrue(adapter.hasSeparateAudioTrack())
+        assertEquals(4, reqs.size) // 2 video + 2 audio
+
+        val videoReqs = reqs.filter { it.trackType == C.TRACK_TYPE_VIDEO }
+        val audioReqs = reqs.filter { it.trackType == C.TRACK_TYPE_AUDIO }
+
+        assertEquals(2, videoReqs.size)
+        assertEquals(2, audioReqs.size)
+
+        assertEquals("https://cdn.example.com/hls/video_0.ts", videoReqs[0].dataSpec.uri.toString())
+        assertEquals("https://cdn.example.com/hls/audio_0.aac", audioReqs[0].dataSpec.uri.toString())
+    }
+
+    @Test
     fun `MP4 container parser successfully parses nested ISO BMFF container and leaf boxes`() {
         val adapter = Mp4RangePrefetchAdapter(
             sourceUri = mp4Uri,
@@ -576,7 +680,8 @@ class FormatAdaptersTest {
         // Test scheduling: from start (0s)
         val snap0 = createSnapshot(currentPositionMs = 0L, bufferedPositionMs = 0L, durationMs = 2000L, sourceUri = mp4Uri, selectedMime = "video/mp4")
         val reqs0 = adapter.getUpcomingRequests(snap0, 50L * 1024L * 1024L)
-        assertEquals(2, reqs0.size)
+        val mediaReqs0 = reqs0.filter { !it.isInit }
+        assertEquals(2, mediaReqs0.size)
 
         // From 1.0s: chunk 0 ended around 866ms, so chunk 0 is skipped and only chunk 1 is scheduled!
         val snapMid = createSnapshot(currentPositionMs = 1000L, bufferedPositionMs = 1000L, durationMs = 2000L, sourceUri = mp4Uri, selectedMime = "video/mp4")

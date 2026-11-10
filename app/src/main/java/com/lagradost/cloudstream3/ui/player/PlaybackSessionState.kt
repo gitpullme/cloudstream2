@@ -280,6 +280,9 @@ class PlaybackSessionState(
                     return false
                 }
             }
+            // For prefetch mode: do not fall through to global prefix match which protects all spans.
+            // Spans not actively leased or within retention window are eligible for eviction.
+            return false
         }
 
         // Check against active media URI
