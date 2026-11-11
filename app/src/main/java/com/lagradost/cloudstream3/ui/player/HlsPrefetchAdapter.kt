@@ -21,6 +21,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Audio rendition topology for HLS presentations.
+ *
+ * Retained for diagnostics/back-compat; the coordinator now consumes [AudioDependency] so that
+ * "audio required but playlist unavailable" can never be mistaken for muxed audio.
  */
 enum class HlsAudioTopology {
     MUXED_AUDIO_VIDEO,
@@ -53,13 +56,58 @@ class HlsPrefetchAdapter(
     var audioTopology: HlsAudioTopology = HlsAudioTopology.MUXED_AUDIO_VIDEO
         private set
 
-    private val cachedAudioPlaylists = ConcurrentHashMap<Uri, HlsMediaPlaylist>()
+    // ---- Explicit audio topology (Part D) ----
+    @Volatile
+    var requiresSeparateAudio: Boolean = false
+        private set
 
+    @Volatile
+    var selectedAudioRenditionIdentity: String? = null
+        private set
+
+    @Volatile
+    var audioPlaylistReady: Boolean = false
+        private set
+
+    @Volatile
+    var audioInitializationReady: Boolean = false
+        private set
+
+    @Volatile
+    var audioSegmentsCoveredUntilUs: Long = 0L
+        private set
+
+    @Volatile
+    var audioFailureReason: String? = null
+        private set
+
+    /** True once the muxed/separate decision has actually been evaluated at least once. */
+    @Volatile
+    private var topologyResolved: Boolean = false
+
+    /**
+     * True when audio depends on a separate rendition that is confirmed usable.
+     * Note this is intentionally NOT a test of "some audio exists".
+     */
     override fun hasSeparateAudioTrack(): Boolean =
         audioTopology == HlsAudioTopology.SEPARATE_AUDIO_READY
 
+    override val audioDependency: AudioDependency
+        get() = when {
+            !topologyResolved -> AudioDependency.UNKNOWN
+            requiresSeparateAudio && audioPlaylistReady -> AudioDependency.SEPARATE_READY
+            requiresSeparateAudio -> AudioDependency.SEPARATE_UNAVAILABLE
+            audioTopology == HlsAudioTopology.NO_AUDIO_TRACK -> AudioDependency.NONE
+            else -> AudioDependency.MUXED
+        }
+
+    private val cachedAudioPlaylists = ConcurrentHashMap<Uri, HlsMediaPlaylist>()
+
     internal fun setAudioPlaylistForTesting(uri: Uri, playlist: HlsMediaPlaylist) {
         cachedAudioPlaylists[uri] = playlist
+        requiresSeparateAudio = true
+        audioPlaylistReady = true
+        topologyResolved = true
         audioTopology = HlsAudioTopology.SEPARATE_AUDIO_READY
     }
 
@@ -257,15 +305,25 @@ class HlsPrefetchAdapter(
         // 3. Audio Rendition Segments & Encryption Keys (Separate Audio Renditions)
         val audioRenditions = multivariant?.audios.orEmpty()
         val audioRendition = resolveSelectedAudioRendition(audioRenditions, snapshot.currentTracks)
+        topologyResolved = true
 
         if (audioRendition != null) {
+            selectedAudioRenditionIdentity = audioRendition.name ?: audioRendition.url?.toString()
             val audioUrl = audioRendition.url
             if (audioUrl == null) {
+                // Rendition without its own URI: audio is muxed into the variant stream.
+                requiresSeparateAudio = false
+                audioPlaylistReady = false
+                audioFailureReason = null
                 audioTopology = HlsAudioTopology.MUXED_AUDIO_VIDEO
             } else {
+                requiresSeparateAudio = true
+                audioPlaylistReady = false
+                audioFailureReason = null
                 audioTopology = HlsAudioTopology.SEPARATE_AUDIO_REQUIRED
                 val audioPlaylist = fetchAudioPlaylist(audioUrl)
                 if (audioPlaylist != null) {
+                    audioPlaylistReady = true
                     audioTopology = HlsAudioTopology.SEPARATE_AUDIO_READY
                     val audioBaseUri = audioPlaylist.baseUri
 
@@ -282,6 +340,7 @@ class HlsPrefetchAdapter(
                             .build()
                         val initIdentity = PrefetchRequestIdentity.fromDataSpec(initSpec, cacheKeyFactory, defaultHeaders)
                         audioInitKey = initIdentity.cacheKey
+                        audioInitializationReady = true
                         requests += PrefetchRequest(
                             identity = initIdentity,
                             priority = PrefetchRequest.Priority.IMMEDIATE,
@@ -304,6 +363,7 @@ class HlsPrefetchAdapter(
                     }
 
                     val scheduledAudioKeys = mutableSetOf<String>()
+                    var audioCoveredUntilUs = audioSegmentsCoveredUntilUs
                     for (audioSeg in audioPlaylist.segments) {
                         val segStartUs = audioSeg.relativeStartTimeUs + audioTimelineOffsetUs
                         val segDurationUs = audioSeg.durationUs
@@ -355,6 +415,8 @@ class HlsPrefetchAdapter(
                                 else -> PrefetchRequest.Priority.USEFUL_PREFETCH
                             }
 
+                            audioCoveredUntilUs = maxOf(audioCoveredUntilUs, segEndUs)
+
                             requests += PrefetchRequest(
                                 identity = identity,
                                 priority = priority,
@@ -367,13 +429,30 @@ class HlsPrefetchAdapter(
                             )
                         }
                     }
+                    audioSegmentsCoveredUntilUs = audioCoveredUntilUs
                 } else {
+                    // Audio is required but its playlist is not usable. This is NOT muxed audio and
+                    // offline coverage must not advance past the playhead.
+                    audioPlaylistReady = false
+                    audioInitializationReady = false
+                    audioFailureReason = "audio playlist unavailable for ${PlaybackCacheAudit.safeUriPath(audioUrl)}"
                     audioTopology = HlsAudioTopology.SEPARATE_AUDIO_UNAVAILABLE
-                    Log.w(TAG, "Separate audio required but playlist fetch failed for $audioUrl; maintaining SEPARATE_AUDIO_UNAVAILABLE requirement")
+                    Log.w(TAG, "Separate audio required but playlist fetch failed; coverage will not advance")
                 }
             }
         } else {
-            audioTopology = if (audioRenditions.isNotEmpty()) HlsAudioTopology.SEPARATE_AUDIO_REQUIRED else HlsAudioTopology.MUXED_AUDIO_VIDEO
+            // No selected rendition, but the presentation declares audio renditions: audio is
+            // required and we cannot verify it. Never report video-only coverage.
+            requiresSeparateAudio = audioRenditions.isNotEmpty()
+            audioPlaylistReady = false
+            audioInitializationReady = false
+            if (requiresSeparateAudio) {
+                audioFailureReason = "declared audio renditions but no selected rendition could be resolved"
+                audioTopology = HlsAudioTopology.SEPARATE_AUDIO_UNAVAILABLE
+            } else {
+                audioFailureReason = null
+                audioTopology = HlsAudioTopology.MUXED_AUDIO_VIDEO
+            }
         }
 
         maybeLogDiagnostics(mediaPlaylist, snapshot, upcomingCount, firstScheduledUs)
@@ -385,7 +464,7 @@ class HlsPrefetchAdapter(
         )
     }
 
-    private fun resolveSelectedAudioRendition(
+    internal fun resolveSelectedAudioRendition(
         audios: List<HlsMultivariantPlaylist.Rendition>,
         currentTracks: Tracks?,
     ): HlsMultivariantPlaylist.Rendition? {
@@ -398,8 +477,8 @@ class HlsPrefetchAdapter(
                             val format = group.getTrackFormat(i)
                             val match = audios.firstOrNull { rendition ->
                                 (format.id != null && rendition.format.id == format.id) ||
-                                (format.label != null && rendition.name.equals(format.label, ignoreCase = true)) ||
-                                (format.language != null && rendition.format.language.equals(format.language, ignoreCase = true))
+                                    (format.label != null && rendition.name.equals(format.label, ignoreCase = true)) ||
+                                    (format.language != null && rendition.format.language.equals(format.language, ignoreCase = true))
                             }
                             if (match != null) return match
                         }
@@ -432,7 +511,7 @@ class HlsPrefetchAdapter(
                 null
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "Failed to load audio playlist $audioUri: ${t.message}")
+            Log.w(TAG, "Failed to load audio playlist ${PlaybackCacheAudit.safeUriPath(audioUri)}: ${t.message}")
             null
         }
     }
@@ -453,7 +532,9 @@ class HlsPrefetchAdapter(
             "HLS Timeline: hasProgramDateTime=${mediaPlaylist.hasProgramDateTime}, rawStartTimeUs=${mediaPlaylist.startTimeUs}, " +
                 "durationUs=${mediaPlaylist.durationUs}, playerPosMs=${snapshot.currentPositionMs}, bufferedPosMs=${snapshot.bufferedPositionMs}, " +
                 "segmentsTotal=${mediaPlaylist.segments.size}, upcomingScheduled=$upcomingCount, firstScheduledUs=$firstScheduledSegmentTimeUs, " +
-                "audioTopology=$audioTopology"
+                "audioTopology=$audioTopology audioDependency=$audioDependency " +
+                "requiresSeparateAudio=$requiresSeparateAudio audioPlaylistReady=$audioPlaylistReady " +
+                "audioFailure=${audioFailureReason ?: "none"}"
         )
     }
 

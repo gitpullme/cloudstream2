@@ -304,8 +304,15 @@ class PlaybackPrefetchThreadAndStorageTest {
                 CacheCoverageVerifier.isFullyCached(cache, key, 0L, -1L)
             )
 
-            // Once marked completed (EOF reached by CacheWriter)
-            CacheCoverageVerifier.markCompleted(key)
+            // Once exact EOF completion evidence is recorded for the verified interval
+            CacheCoverageVerifier.markCompleted(
+                cacheKey = key,
+                startByte = 0L,
+                endByteExclusive = 1L,
+                reachedEof = true,
+                contentLengthBytes = 1L,
+                cache = cache,
+            )
             assertTrue(
                 "Segment marked completed to EOF must be treated as fully complete",
                 CacheCoverageVerifier.isFullyCached(cache, key, 0L, -1L)

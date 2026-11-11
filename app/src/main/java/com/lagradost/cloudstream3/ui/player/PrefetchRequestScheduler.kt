@@ -30,16 +30,45 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * Outcome of handing a Media3 request over from a background prefetch writer.
+ *
+ * [WriterCancelledAndUnlocked] is only returned when the worker completion latch actually counted
+ * down, i.e. CacheWriter returned/aborted and therefore released its cache span lock. It is never
+ * derived from [CacheWriter.cancel] alone.
+ */
+@OptIn(UnstableApi::class)
+sealed interface CacheHandoffResult {
+    /** Nothing was prefetching this cache key/range. Playback may open the cache normally. */
+    data object NoMatchingWriter : CacheHandoffResult
+
+    /** The requested bytes are already complete in SimpleCache; no handoff was needed. */
+    data object AlreadyCompleted : CacheHandoffResult
+
+    /** Every overlapping prefetch worker terminated and released its span lock. */
+    data class WriterCancelledAndUnlocked(
+        val cancelledQueuedRequests: Int,
+        val releasedRunningRequests: Int,
+    ) : CacheHandoffResult
+
+    /**
+     * A worker still holds a cache span lock over the requested bytes. The caller must not open a
+     * cache reader for this request; it has to fall back to upstream explicitly.
+     */
+    data class LockStillHeld(val reason: String) : CacheHandoffResult
+}
+
+/**
  * Priority queue, deduplication registry, and bounded concurrency scheduler for media prefetching.
  * Inspired by FastStream's DownloadManager.
  *
  * Requirements:
  * - Thread-safe synchronization on a single lock object.
- * - URL/range/headers deduplication with exact cache-key matching.
+ * - Cache-key + byte-interval deduplication (overlap aware, not just exact DataSpec equality).
  * - Strict storage-budget enforcement: background prefetch never bypasses the limit.
  * - Worker reservation tracking to prevent collective oversubscription.
  * - Bounded parallel workers (1 to 4 max on Android).
- * - Single-writer coordination: prefetch cancels and cleanly yields before Media3 writes.
+ * - Single-writer coordination: prefetch cancels and provably yields before Media3 writes, and no
+ *   worker may start writing a cache key while a Media3 playback request is using it.
  * - Complete lifecycle cancellation on release.
  */
 @OptIn(UnstableApi::class)
@@ -60,7 +89,16 @@ class PrefetchRequestScheduler(
         const val BUFFER_SIZE = 32 * 1024 // 32 KB chunk
         const val MAX_RETRIES = 2
         const val BACKOFF_DELAY_MS = 1500L
-        const val HANDOFF_TIMEOUT_MS = 100L
+
+        /**
+         * Upper bound on how long a Media3 loading thread may wait for a cancelled writer to release
+         * its cache span lock. This is a deadline, not a success criterion: exceeding it produces
+         * [CacheHandoffResult.LockStillHeld] and an explicit upstream fallback.
+         */
+        const val HANDOFF_TIMEOUT_MS = 2_000L
+
+        /** How long a worker defers a request whose cache key is currently used by playback. */
+        private const val PLAYBACK_KEY_DEFER_MS = 200L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -76,8 +114,11 @@ class PrefetchRequestScheduler(
     private val activeWorkerLatches = ConcurrentHashMap<String, CountDownLatch>()
     private val activeWorkerJobs = ConcurrentHashMap<Int, Job>()
 
-    // In-flight media3 upstream downloads
+    // In-flight media3 requests
     val media3ActiveRequests = ConcurrentHashMap.newKeySet<PrefetchRequestIdentity>()
+
+    // Cache keys currently held by Media3 playback (reference counted across DataSources)
+    private val media3KeyUsers = ConcurrentHashMap<String, AtomicInteger>()
 
     // Storage reservations (bytes actively claimed by running workers)
     val reservedBytes = AtomicLong(0L)
@@ -104,6 +145,9 @@ class PrefetchRequestScheduler(
         ensureWorkerPool()
     }
 
+    private val audit: PlaybackCacheAudit?
+        get() = session.cacheAudit
+
     fun getTargetWorkers(): Int = targetWorkers.get()
 
     fun getActiveWorkerCount(): Int = activeWorkerCount.get()
@@ -113,6 +157,10 @@ class PrefetchRequestScheduler(
     fun isActivelyWritingKey(cacheKey: String): Boolean {
         return registry.values.any { it.status == PrefetchRequest.Status.RUNNING && it.identity.cacheKey == cacheKey }
     }
+
+    /** True when an actual Media3 playback request currently occupies this cache key. */
+    fun isKeyInPlaybackUse(cacheKey: String): Boolean =
+        (media3KeyUsers[cacheKey]?.get() ?: 0) > 0
 
     /**
      * Enqueues or deduplicates a prefetch request.
@@ -174,44 +222,103 @@ class PrefetchRequestScheduler(
 
     /**
      * Called when Media3 begins loading a resource.
-     * Cancels any overlapping background prefetch and coordinates single-writer cache access.
+     *
+     * Cancels queued/overlapping background prefetch, cancels a running prefetch writer over the
+     * same byte interval, and waits for the worker's actual completion (which is what releases the
+     * SimpleCache span lock). Running on Media3's loading thread, never on the player main thread.
      */
-    fun onMedia3RequestStarting(identity: PrefetchRequestIdentity): PrefetchRequest? {
+    fun onMedia3RequestStarting(identity: PrefetchRequestIdentity): CacheHandoffResult {
         media3ActiveRequests.add(identity)
+        media3KeyUsers.getOrPut(identity.cacheKey) { AtomicInteger(0) }.incrementAndGet()
 
-        var matchedRequest: PrefetchRequest? = null
-        var latchToAwait: CountDownLatch? = null
+        val queued = mutableListOf<PrefetchRequest>()
+        val running = mutableListOf<PrefetchRequest>()
 
         synchronized(lock) {
-            val inFlight = registry[identity]
-            if (inFlight != null) {
-                matchedRequest = inFlight
-                inFlight.priority = PrefetchRequest.Priority.IMMEDIATE
-
-                if (inFlight.status == PrefetchRequest.Status.QUEUED) {
-                    priorityQueue.remove(inFlight)
-                    inFlight.status = PrefetchRequest.Status.CANCELLED
-                    cancelledCount.incrementAndGet()
-                } else if (inFlight.status == PrefetchRequest.Status.RUNNING) {
-                    // Cancel the background prefetch writer so Media3 takes over without conflicting span locks
-                    activeWriters[inFlight.id]?.cancel()
-                    latchToAwait = activeWorkerLatches[inFlight.id]
+            for (req in registry.values) {
+                if (req.isTerminal()) continue
+                if (!req.identity.overlaps(identity)) continue
+                when (req.status) {
+                    PrefetchRequest.Status.QUEUED -> {
+                        if (priorityQueue.remove(req)) {
+                            req.status = PrefetchRequest.Status.CANCELLED
+                            cancelledCount.incrementAndGet()
+                            audit?.onPrefetchCancelled()
+                            queued += req
+                        }
+                    }
+                    PrefetchRequest.Status.RUNNING -> {
+                        req.priority = PrefetchRequest.Priority.IMMEDIATE
+                        running += req
+                    }
+                    else -> Unit
                 }
             }
         }
 
-        // Await background writer shutdown on loader thread (never on main thread)
-        latchToAwait?.let { latch ->
-            runCatching {
-                latch.await(HANDOFF_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        // Request cancellation of every overlapping writer. The flag makes a cancelled writer
+        // terminal, so it can never be retried or reported as a failure.
+        for (req in running) {
+            req.cancelRequested = true
+            runCatching { activeWriters[req.id]?.cancel() }
+        }
+
+        // Wait for the real worker completion. The latch is counted down in the worker's finally
+        // block, which is only reached after CacheWriter.cache() returned (or threw) and therefore
+        // after the cache span lock was released.
+        var lockReleased = true
+        var lockReason: String? = null
+        val deadline = clock() + HANDOFF_TIMEOUT_MS
+        for (req in running) {
+            val latch = activeWorkerLatches[req.id]
+            if (latch == null) {
+                // Worker already passed its finally block between poll and here.
+                if (activeWriters.containsKey(req.id)) {
+                    lockReleased = false
+                    lockReason = "worker ${req.id.take(8)} has no completion latch but is still writing"
+                }
+                continue
+            }
+            val remaining = max(0L, deadline - clock())
+            val completed = runCatching { latch.await(remaining, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            if (!completed) {
+                lockReleased = false
+                lockReason = "cache writer for keyHash=${PlaybackCacheAudit.safeKeyHash(req.identity.cacheKey)} " +
+                    "did not release its span lock within ${HANDOFF_TIMEOUT_MS}ms"
+                break
             }
         }
 
-        return matchedRequest
+        if (lockReleased && running.any { activeWriters.containsKey(it.id) }) {
+            lockReleased = false
+            lockReason = "cache writer still registered after completion"
+        }
+
+        if (!lockReleased) {
+            return CacheHandoffResult.LockStillHeld(
+                lockReason ?: "cache writer did not release its span lock in time"
+            )
+        }
+
+        val cache = getCache()
+        val alreadyCompleted = cache != null &&
+            CacheCoverageVerifier.isFullyCached(cache, identity)
+        if (alreadyCompleted) return CacheHandoffResult.AlreadyCompleted
+
+        return if (queued.isNotEmpty() || running.isNotEmpty()) {
+            CacheHandoffResult.WriterCancelledAndUnlocked(queued.size, running.size)
+        } else {
+            CacheHandoffResult.NoMatchingWriter
+        }
     }
 
     fun onMedia3RequestFinished(identity: PrefetchRequestIdentity) {
         media3ActiveRequests.remove(identity)
+        media3KeyUsers[identity.cacheKey]?.let { counter ->
+            if (counter.decrementAndGet() <= 0) {
+                media3KeyUsers.remove(identity.cacheKey, counter)
+            }
+        }
     }
 
     /**
@@ -228,6 +335,7 @@ class PrefetchRequestScheduler(
                     iterator.remove()
                     req.status = PrefetchRequest.Status.CANCELLED
                     cancelledCount.incrementAndGet()
+                    audit?.onPrefetchCancelled()
                     obsoleteRequests += req
                 }
             }
@@ -237,6 +345,7 @@ class PrefetchRequestScheduler(
                     if (req.status != PrefetchRequest.Status.COMPLETED && req.status != PrefetchRequest.Status.CANCELLED) {
                         req.status = PrefetchRequest.Status.CANCELLED
                         cancelledCount.incrementAndGet()
+                        audit?.onPrefetchCancelled()
                         obsoleteRequests += req
                     }
                 }
@@ -244,6 +353,7 @@ class PrefetchRequestScheduler(
         }
 
         for (req in obsoleteRequests) {
+            req.cancelRequested = true
             activeWriters[req.id]?.cancel()
         }
     }
@@ -281,6 +391,15 @@ class PrefetchRequestScheduler(
                     continue
                 }
 
+                // Single-writer rule: never write bytes a Media3 playback request is reading.
+                if (request.status == PrefetchRequest.Status.QUEUED && isKeyInPlaybackUse(request.identity.cacheKey)) {
+                    synchronized(lock) {
+                        if (!request.isTerminal()) priorityQueue.offer(request)
+                    }
+                    delay(PLAYBACK_KEY_DEFER_MS)
+                    continue
+                }
+
                 // Atomically check storage capacity and claim worker reservation
                 if (!tryAdmitAndReserve(request)) {
                     synchronized(lock) {
@@ -312,7 +431,19 @@ class PrefetchRequestScheduler(
             return
         }
 
-        // Verify if already cached
+        // Playback owns this key right now: do not open a second overlapping writer.
+        if (isKeyInPlaybackUse(request.identity.cacheKey)) {
+            synchronized(lock) {
+                if (!request.isTerminal()) {
+                    request.status = PrefetchRequest.Status.QUEUED
+                    priorityQueue.offer(request)
+                }
+            }
+            reservedBytes.updateAndGet { cur -> maxOf(0L, cur - estimatedBytes) }
+            return
+        }
+
+        // Verify if already cached (exact evidence only)
         if (CacheCoverageVerifier.isFullyCached(cache, request.identity.cacheKey, request.identity.position, request.identity.length)) {
             reservedBytes.updateAndGet { cur -> maxOf(0L, cur - estimatedBytes) }
             cacheHitCount.incrementAndGet()
@@ -324,6 +455,7 @@ class PrefetchRequestScheduler(
         cacheMissCount.incrementAndGet()
         request.status = PrefetchRequest.Status.RUNNING
         activeWorkerCount.incrementAndGet()
+        audit?.onPrefetchStarted()
 
         val latch = CountDownLatch(1)
         activeWorkerLatches[request.id] = latch
@@ -338,6 +470,8 @@ class PrefetchRequestScheduler(
         )
 
         val cacheDataSource = factory.createDataSource()
+        var writtenBytes = 0L
+        var reusedBytes = 0L
         val writer = CacheWriter(
             cacheDataSource,
             request.dataSpec,
@@ -345,7 +479,11 @@ class PrefetchRequestScheduler(
             { total, bytesAlreadyCached, newBytesCached ->
                 request.totalBytes = total
                 request.bytesDownloaded = bytesAlreadyCached + newBytesCached
+                writtenBytes += newBytesCached
+                reusedBytes = bytesAlreadyCached
                 prefetchedBytes.addAndGet(newBytesCached)
+                audit?.onPrefetchBytesWritten(newBytesCached, 0L)
+                audit?.onPrefetchUpstreamBytes(newBytesCached)
             }
         )
         activeWriters[request.id] = writer
@@ -353,18 +491,44 @@ class PrefetchRequestScheduler(
         val startTime = clock()
         try {
             writer.cache()
-            CacheCoverageVerifier.markCompleted(request.identity.cacheKey)
+
+            // Exact completion evidence: end = requested position + resolved request length.
+            val resolvedLength = when {
+                request.identity.length > 0L -> request.identity.length
+                request.totalBytes > 0L -> request.totalBytes
+                request.bytesDownloaded > 0L -> request.bytesDownloaded
+                else -> -1L
+            }
+            CacheCoverageVerifier.markCompleted(
+                cacheKey = request.identity.cacheKey,
+                startByte = request.identity.position,
+                endByteExclusive = if (resolvedLength > 0L) request.identity.position + resolvedLength else -1L,
+                reachedEof = true,
+                contentLengthBytes = if (request.totalBytes > 0L) request.totalBytes else resolvedLength,
+                cache = cache,
+            )
+            if (reusedBytes > 0L) audit?.onPrefetchBytesWritten(0L, reusedBytes)
+
             request.status = PrefetchRequest.Status.COMPLETED
+            audit?.onPrefetchCompleted(clock() - startTime)
             session.prefetchCoordinator?.registerCompletedRequest(request)
             onDownloadSuccess(request.bytesDownloaded, clock() - startTime)
         } catch (e: Throwable) {
-            if (e is CancellationException || (e is IOException && e.message?.contains("canceled", ignoreCase = true) == true)) {
+            val wasCancelled = request.cancelRequested ||
+                isReleased.get() ||
+                e is CancellationException ||
+                e is java.io.InterruptedIOException ||
+                e is InterruptedException ||
+                (e is IOException && e.message?.contains("cancel", ignoreCase = true) == true)
+            if (wasCancelled) {
                 request.status = PrefetchRequest.Status.CANCELLED
                 cancelledCount.incrementAndGet()
+                audit?.onPrefetchCancelled()
             } else {
-                Log.w(TAG, "prefetch failed for ${request.identity.cacheKey}: ${e.message}")
+                Log.w(TAG, "prefetch failed for keyHash=${PlaybackCacheAudit.safeKeyHash(request.identity.cacheKey)}: ${e.message}")
                 request.error = e
                 request.status = PrefetchRequest.Status.FAILED
+                audit?.onPrefetchFailed()
                 onDownloadError(e)
 
                 if (request.retryCount < MAX_RETRIES && isRetryableError(e)) {
@@ -491,6 +655,9 @@ class PrefetchRequestScheduler(
 
     fun release() {
         if (isReleased.compareAndSet(false, true)) {
+            for (req in registry.values) {
+                req.cancelRequested = true
+            }
             for ((_, writer) in activeWriters) {
                 runCatching { writer.cancel() }
             }
@@ -504,6 +671,7 @@ class PrefetchRequestScheduler(
             activeWorkerJobs.clear()
 
             media3ActiveRequests.clear()
+            media3KeyUsers.clear()
             synchronized(lock) {
                 priorityQueue.clear()
             }

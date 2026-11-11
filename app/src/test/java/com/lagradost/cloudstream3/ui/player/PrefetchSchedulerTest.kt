@@ -205,10 +205,12 @@ class PrefetchSchedulerTest {
         )
         scheduler.enqueue(prefetchReq)
 
-        // Media3 requests this exact resource
-        val inFlight = scheduler.onMedia3RequestStarting(identity)
-        assertNotNull(inFlight)
-        assertEquals(PrefetchRequest.Priority.IMMEDIATE, inFlight?.priority)
+        // Media3 requests this exact resource. The handoff must never report a held cache lock, and
+        // the key must be owned by playback so no prefetch worker can open a second writer.
+        val handoff = scheduler.onMedia3RequestStarting(identity)
+        assertTrue("handoff must never report a held cache lock: $handoff", handoff !is CacheHandoffResult.LockStillHeld)
+        assertTrue(scheduler.isKeyInPlaybackUse(identity.cacheKey))
+        assertFalse(scheduler.isActivelyWritingKey(identity.cacheKey))
         assertTrue(scheduler.media3ActiveRequests.contains(identity))
 
         // When Media3 is done

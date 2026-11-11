@@ -117,6 +117,12 @@ class PlaybackSessionState(
     // Optional prefetch coordinator for this session
     var prefetchCoordinator: PlaybackPrefetchCoordinator? = null
 
+    /**
+     * Independent measurements for the two consumers of the shared SimpleCache: the background
+     * prefetch pipeline and the real Media3 playback pipeline.
+     */
+    var cacheAudit: PlaybackCacheAudit? = null
+
     // Dedicated network monitor for this session
     val networkMonitor: PlaybackNetworkMonitor = PlaybackNetworkMonitor(sessionId, clock)
 

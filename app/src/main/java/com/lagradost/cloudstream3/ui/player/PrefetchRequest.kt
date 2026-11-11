@@ -19,6 +19,11 @@ data class PrefetchRequest(
     val dataSpec: DataSpec,
     val dependencyKeys: List<String> = emptyList(),
     @Volatile var status: Status = Status.QUEUED,
+    /**
+     * Set when the scheduler asked this request's CacheWriter to stop (playback handoff, seek or
+     * release). A cancelled writer must never be retried and must never be reported as failed.
+     */
+    @Volatile var cancelRequested: Boolean = false,
     @Volatile var bytesDownloaded: Long = 0L,
     @Volatile var totalBytes: Long = -1L,
     @Volatile var watchers: Int = 1,

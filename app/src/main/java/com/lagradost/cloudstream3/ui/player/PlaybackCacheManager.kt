@@ -582,6 +582,8 @@ object PlaybackCacheManager {
                 removeLocked(span)
                 pendingRemoval.remove(span)
             }
+            // Delivered outside the evictor lock and safe to call into the verifier.
+            CacheCoverageVerifier.onSpanRemoved(span)
         }
 
         override fun onSpanTouched(cache: Cache, oldSpan: CacheSpan, newSpan: CacheSpan) {

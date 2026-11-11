@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Dynamic format adapter resolution (HLS, DASH, MP4) with explicit lifecycle states.
  * - Usable storage-budget calculation with strict limit enforcement and atomic reservations.
  * - Per-interval dependency tracking (init segments, AES-128 keys) without global seekbar freeze.
- * - High-precision verified offline playability coverage calculation.
+ * - Verified offline playability coverage, which is what the blue seekbar paints.
  */
 @OptIn(UnstableApi::class)
 class PlaybackPrefetchCoordinator(
@@ -94,9 +94,13 @@ class PlaybackPrefetchCoordinator(
     internal var lastReportedCoverageMs = -1L
 
     /**
-     * UI callback invoked on Dispatchers.Main with the contiguous prefetched media position in milliseconds.
+     * UI callback invoked on Dispatchers.Main with the contiguous *offline-playable* media position
+     * in milliseconds.
      */
     var onPrefetchCoverageChanged: ((Long) -> Unit)? = null
+
+    private val audit: PlaybackCacheAudit?
+        get() = session.cacheAudit
 
     fun start() {
         if (!session.prefetchModeEnabled || isReleased.get()) {
@@ -104,6 +108,10 @@ class PlaybackPrefetchCoordinator(
         }
         if (started.compareAndSet(false, true)) {
             Log.i(TAG, "Prefetch coordinator started for session ${session.sessionId}")
+            audit?.let { a ->
+                a.coverageOracle = { key, position, length -> isWithinClaimedCoverage(key, position, length) }
+                a.onClaimedRangeMissed = { key -> invalidateCoverageFor(key) }
+            }
             coordinatorJob = scope.launch {
                 runCoordinatorLoop()
             }
@@ -161,7 +169,7 @@ class PlaybackPrefetchCoordinator(
 
         // Check for stream / media item transition
         if (lastSourceUri != null && lastSourceUri != snapshot.sourceUri) {
-            Log.i(TAG, "Stream change detected: $lastSourceUri -> ${snapshot.sourceUri}; resetting coordinator state")
+            Log.i(TAG, "Stream change detected; resetting coordinator state")
             activeAdapter?.release()
             activeAdapter = null
             completedRanges.clear()
@@ -170,7 +178,8 @@ class PlaybackPrefetchCoordinator(
         }
         lastSourceUri = snapshot.sourceUri
 
-        // 2. Resolve adapter if not yet initialized
+        // 2. Resolve adapter if not yet initialized. Resolution may return an adapter that is only
+        //    WAITING_FOR_MANIFEST; readiness is retried from every future snapshot.
         var adapter = activeAdapter
         if (adapter == null) {
             adapter = resolveAdapter(snapshot)
@@ -179,10 +188,12 @@ class PlaybackPrefetchCoordinator(
 
         if (adapter == null) return
 
-        // Advance adapter readiness state (e.g. from WAITING_FOR_MANIFEST -> READY)
         val currentState = adapter.checkReadiness(snapshot)
         if (currentState != AdapterState.READY) {
             maybeLogDiagnostics(snapshot, 0L, reasonStopped = "Adapter waiting: $currentState")
+            if (currentState == AdapterState.RELEASED || currentState == AdapterState.UNSUPPORTED) {
+                activeAdapter = null
+            }
             return
         }
 
@@ -224,7 +235,7 @@ class PlaybackPrefetchCoordinator(
         )
         if (hlsAdapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = hlsAdapter.name
-            Log.i(TAG, "Selected HLS prefetch adapter for $uri (state=${hlsAdapter.state})")
+            Log.i(TAG, "Selected HLS prefetch adapter (state=${hlsAdapter.state})")
             return hlsAdapter
         }
 
@@ -234,7 +245,7 @@ class PlaybackPrefetchCoordinator(
         )
         if (dashAdapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = dashAdapter.name
-            Log.i(TAG, "Selected DASH prefetch adapter for $uri (state=${dashAdapter.state})")
+            Log.i(TAG, "Selected DASH prefetch adapter (state=${dashAdapter.state})")
             return dashAdapter
         }
 
@@ -246,17 +257,12 @@ class PlaybackPrefetchCoordinator(
         )
         if (mp4Adapter.isSupported(uri, mime, manifest)) {
             selectedAdapterName = mp4Adapter.name
-            Log.i(TAG, "Selected progressive MP4 prefetch adapter for $uri (state=${mp4Adapter.state})")
+            Log.i(TAG, "Selected progressive MP4 prefetch adapter (state=${mp4Adapter.state})")
             return mp4Adapter
         }
 
-        // If manifest not loaded yet on first snapshot for HLS/DASH, do not permanently disable
-        if (manifest == null && (uri.path?.endsWith(".m3u8") == true || uri.path?.endsWith(".mpd") == true)) {
-            return null
-        }
-
         selectedAdapterName = "Media3 Standard (Fallback)"
-        Log.i(TAG, "No specialized prefetch adapter for $uri; using standard Media3 loading")
+        Log.i(TAG, "No specialized prefetch adapter; using standard Media3 loading")
         return null
     }
 
@@ -345,6 +351,30 @@ class PlaybackPrefetchCoordinator(
         updateCoverage(snapshot)
     }
 
+    /** Drops coverage claims for a cache key that playback proved was not actually readable. */
+    internal fun invalidateCoverageFor(cacheKey: String) {
+        val removed = completedRanges.removeIf { it.cacheKey == cacheKey }
+        if (removed) {
+            Log.w(TAG, "invalidating unverified coverage for keyHash=${PlaybackCacheAudit.safeKeyHash(cacheKey)}")
+            latestSnapshot?.let { updateCoverage(it) }
+        }
+    }
+
+    private fun isWithinClaimedCoverage(cacheKey: String, position: Long, length: Long): Boolean {
+        if (lastReportedCoverageMs <= 0L) return false
+        return completedRanges.any { range ->
+            range.cacheKey == cacheKey &&
+                range.mediaTimeEndUs <= lastReportedCoverageMs * 1000L + CONTIGUOUS_GAP_TOLERANCE_US
+        }
+    }
+
+    private fun dependenciesSatisfied(cache: Cache?, range: PrefetchCoverageRange): Boolean {
+        if (range.dependencyKeys.isEmpty()) return true
+        return range.dependencyKeys.all { depKey ->
+            CacheCoverageVerifier.isResourceComplete(cache, depKey)
+        }
+    }
+
     private fun computeContiguousSpanEnd(
         cache: Cache?,
         ranges: List<PrefetchCoverageRange>,
@@ -352,12 +382,9 @@ class PlaybackPrefetchCoordinator(
     ): Long {
         if (cache == null) return playheadUs
 
-        // Filter ranges that have ALL per-interval dependencies (init segment, AES key) fully verified
-        val validRanges = ranges.filter { range ->
-            range.dependencyKeys.isEmpty() || range.dependencyKeys.all { depKey ->
-                CacheCoverageVerifier.isFullyCached(cache, depKey, 0L, -1L)
-            }
-        }
+        // Filter ranges that have ALL per-interval dependencies (init segment, AES key) verified.
+        // A missing key for a FUTURE interval must not block an earlier interval.
+        val validRanges = ranges.filter { dependenciesSatisfied(cache, it) }
 
         val sorted = validRanges
             .filter { it.mediaTimeEndUs >= playheadUs }
@@ -382,18 +409,40 @@ class PlaybackPrefetchCoordinator(
         val cache = getCache()
         val playheadUs = maxOf(currentPositionUs, bufferedPositionUs)
 
-        // Separate verified ranges by track
         val videoRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_VIDEO }
         val audioRanges = completedRanges.filter { it.trackType == C.TRACK_TYPE_AUDIO }
 
         val contiguousVideoEndUs = computeContiguousSpanEnd(cache, videoRanges, playheadUs)
-        val hasSeparateAudio = activeAdapter?.hasSeparateAudioTrack() == true && audioRanges.isNotEmpty()
+        val contiguousAudioEndUs = computeContiguousSpanEnd(cache, audioRanges, playheadUs)
+        val dependency = activeAdapter?.audioDependency ?: AudioDependency.MUXED
 
-        val offlinePlayableUs = if (hasSeparateAudio) {
-            val contiguousAudioEndUs = computeContiguousSpanEnd(cache, audioRanges, playheadUs)
-            minOf(contiguousVideoEndUs, contiguousAudioEndUs)
-        } else {
-            contiguousVideoEndUs
+        // The blue line means "verified offline-playable", not "some bytes downloaded".
+        val offlinePlayableUs = when (dependency) {
+            AudioDependency.MUXED, AudioDependency.NONE -> contiguousVideoEndUs
+            AudioDependency.SEPARATE_READY -> minOf(contiguousVideoEndUs, contiguousAudioEndUs)
+            // Separate audio required but unverifiable: never advance past the playhead.
+            AudioDependency.SEPARATE_UNAVAILABLE, AudioDependency.UNKNOWN -> playheadUs
+        }
+
+        audit?.let { a ->
+            a.offlinePlayableEndMs = offlinePlayableUs / 1000L
+            a.missingAudioDependency = when {
+                dependency == AudioDependency.SEPARATE_UNAVAILABLE ->
+                    (activeAdapter as? HlsPrefetchAdapter)?.audioFailureReason ?: "separate audio unverifiable"
+                dependency == AudioDependency.SEPARATE_READY && contiguousAudioEndUs < contiguousVideoEndUs ->
+                    "audio coverage stops at ${contiguousAudioEndUs / 1000L}ms"
+                else -> null
+            }
+            a.missingVideoDependency = if (contiguousVideoEndUs <= playheadUs && videoRanges.isNotEmpty()) {
+                "video coverage exhausted at ${contiguousVideoEndUs / 1000L}ms"
+            } else {
+                null
+            }
+            a.missingInitializationDependency = completedRanges
+                .firstOrNull { !dependenciesSatisfied(cache, it) }
+                ?.dependencyKeys
+                ?.firstOrNull { !CacheCoverageVerifier.isResourceComplete(cache, it) }
+                ?.let { "init/key missing for range at ${it.take(24)}" }
         }
 
         notifyCoverageChanged(offlinePlayableUs / 1000L)
@@ -436,38 +485,42 @@ class PlaybackPrefetchCoordinator(
             StatFs(context.cacheDir.absolutePath).availableBytes
         }.getOrDefault(0L)
 
-        val posSec = snapshot.currentPositionMs / 1000L
-        val bufSec = snapshot.bufferedPositionMs / 1000L
-        val prefetchSec = maxOf(bufSec, lastReportedCoverageMs / 1000L)
-        val prefetchAheadSec = maxOf(0L, prefetchSec - posSec)
-
-        val safeUri = session.sourceUri?.let { u ->
-            val parsed = Uri.parse(u)
-            "${parsed.scheme}://${parsed.host}${parsed.path}"
-        } ?: "none"
-
         val adapterStateStr = activeAdapter?.state?.name ?: "NONE"
+        val a = audit
+
+        val block = if (a != null) {
+            a.diagnostics(
+                cacheUsageBytes = PlaybackCacheManager.usageBytes(),
+                workersActive = scheduler.getActiveWorkerCount(),
+                workersTarget = scheduler.getTargetWorkers(),
+                queued = scheduler.getQueueDepth(),
+            ) + "\nOFFLINE:" +
+                "\n  verifiedEndpoint=" + formatPosition(a.offlinePlayableEndMs) +
+                "\n  missingVideo=" + (a.missingVideoDependency ?: "none") +
+                "\n  missingAudio=" + (a.missingAudioDependency ?: "none") +
+                "\n  missingInitialization=" + (a.missingInitializationDependency ?: "none")
+        } else {
+            "PREFETCH: downloaded=${PlaybackCacheAudit.formatBytes(scheduler.prefetchedBytes.get())} " +
+                "workers=${scheduler.getActiveWorkerCount()}/${scheduler.getTargetWorkers()} " +
+                "queued=${scheduler.getQueueDepth()}"
+        }
 
         Log.d(
             TAG,
-            "Diagnostics: [PrefetchMode=${session.prefetchModeEnabled}] " +
-                "Session=${session.sessionId} " +
-                "Adapter=$selectedAdapterName(State=$adapterStateStr) " +
-                "Source=$safeUri " +
-                "Cache=${PlaybackCacheManager.usageBytes() / (1024 * 1024)}MB / " +
-                "Limit=${session.prefetchLimitBytes / (1024 * 1024)}MB " +
-                "Reserved=${scheduler.reservedBytes.get() / (1024 * 1024)}MB " +
-                "Reclaimable=${PlaybackCacheManager.reclaimableBytes(session, snapshot) / (1024 * 1024)}MB " +
-                "AvailableBudget=${availableBudgetBytes / (1024 * 1024)}MB " +
-                "FreeDisk=${freeDisk / (1024 * 1024)}MB " +
-                "Workers=${scheduler.getActiveWorkerCount()}/${scheduler.getTargetWorkers()} " +
-                "QueueDepth=${scheduler.getQueueDepth()} " +
-                "Prefetched=${scheduler.prefetchedBytes.get() / (1024 * 1024)}MB " +
-                "PrefetchRunwayAhead=${prefetchAheadSec}s " +
-                "Hits=${scheduler.cacheHitCount.get()} Misses=${scheduler.cacheMissCount.get()} " +
-                "Reuses=${scheduler.duplicateReuseCount.get()} Cancels=${scheduler.cancelledCount.get()}" +
-                (if (reasonStopped != null) " StoppedReason=[$reasonStopped]" else "")
+            "session=${session.sessionId} adapter=$selectedAdapterName($adapterStateStr) " +
+                "availableBudget=${PlaybackCacheAudit.formatBytes(availableBudgetBytes)} " +
+                "freeDisk=${PlaybackCacheAudit.formatBytes(freeDisk)} " +
+                (if (reasonStopped != null) "stopped=[$reasonStopped]\n" else "\n") + block,
         )
+    }
+
+    private fun formatPosition(ms: Long): String {
+        if (ms < 0L) return "none"
+        val totalSeconds = ms / 1000L
+        val h = totalSeconds / 3600L
+        val m = (totalSeconds % 3600L) / 60L
+        val s = totalSeconds % 60L
+        return String.format("%02d:%02d:%02d", h, m, s)
     }
 
     fun release() {
@@ -478,6 +531,10 @@ class PlaybackPrefetchCoordinator(
             activeAdapter?.release()
             activeAdapter = null
             completedRanges.clear()
+            audit?.let {
+                it.coverageOracle = null
+                it.onClaimedRangeMissed = null
+            }
             onPrefetchCoverageChanged = null
             scope.cancel()
         }

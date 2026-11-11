@@ -1381,14 +1381,50 @@ class CS3IPlayer : IPlayer {
                 upstream
             } else {
                 val keyFactory = HeaderAwareCacheKeyFactory(onlineSource.headers)
-                val cacheFactory = CacheDataSource.Factory().apply {
+
+                // One audit per playback session. It separates bytes read by the real ExoPlayer
+                // pipeline from bytes written by background prefetch, so a cache hit can never be
+                // faked by a prefetch worker.
+                val cacheAudit = PlaybackCacheAudit(session.sessionId)
+                session.cacheAudit = cacheAudit
+
+                // Playback upstream: instrumented so upstream bytes are attributed to the playback
+                // request currently open on the loading thread, never to prefetch.
+                val playbackUpstream = PlaybackCacheAudit.UpstreamFactory(upstream, cacheAudit)
+
+                val playbackCacheEventListener = object : CacheDataSource.EventListener {
+                    override fun onCachedBytesRead(cacheSizeBytes: Long, cachedBytesRead: Long) {
+                        loadControl?.cacheEventListener?.onCachedBytesRead(cacheSizeBytes, cachedBytesRead)
+                        cacheAudit.onPlaybackCachedBytes(cachedBytesRead)
+                    }
+
+                    override fun onCacheIgnored(reason: Int) {
+                        loadControl?.cacheEventListener?.onCacheIgnored(reason)
+                        cacheAudit.onPlaybackCacheIgnored(reason)
+                    }
+                }
+
+                // Playback cache factory. FLAG_BLOCK_ON_CACHE makes Media3 wait for an active cache
+                // writer instead of silently fetching the same bytes from upstream (its default
+                // non-blocking span acquisition). The explicit handoff in the routing factory means
+                // that wait is normally already satisfied before open().
+                val playbackCacheFactory = CacheDataSource.Factory().apply {
                     setCache(cache)
-                    setUpstreamDataSourceFactory(upstream)
+                    setUpstreamDataSourceFactory(playbackUpstream)
                     setCacheKeyFactory(keyFactory)
                     // A full disk or a failed cache write must degrade to network playback, not
                     // abort the title.
+                    setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR or CacheDataSource.FLAG_BLOCK_ON_CACHE)
+                    setEventListener(playbackCacheEventListener)
+                }
+
+                // Prefetch cache factory: same SimpleCache instance, same CacheKeyFactory and same
+                // request configuration, but deliberately no playback instrumentation.
+                val prefetchCacheFactory = CacheDataSource.Factory().apply {
+                    setCache(cache)
+                    setUpstreamDataSourceFactory(upstream)
+                    setCacheKeyFactory(keyFactory)
                     setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-                    loadControl?.let { setEventListener(it.cacheEventListener) }
                 }
 
                 if (prefetchModeEnabled) {
@@ -1397,7 +1433,7 @@ class CS3IPlayer : IPlayer {
                         session = session,
                         playerProvider = { exoPlayer },
                         getCache = { PlaybackCacheManager.get(context, simpleCacheSize) },
-                        getCacheDataSourceFactory = { cacheFactory },
+                        getCacheDataSourceFactory = { prefetchCacheFactory },
                         upstreamFactory = upstream,
                         defaultHeaders = onlineSource.headers,
                         cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
@@ -1413,12 +1449,15 @@ class CS3IPlayer : IPlayer {
                 }
 
                 CacheRoutingDataSourceFactory(
-                    cacheFactory = cacheFactory,
-                    upstreamFactory = upstream,
+                    cacheFactory = playbackCacheFactory,
+                    upstreamFactory = playbackUpstream,
                     session = session,
+                    audit = cacheAudit,
                     cacheKeyFactory = { dataSpec -> keyFactory.buildCacheKey(dataSpec) },
                     shouldBypass = { uri ->
-                        (loadControl?.isLiveStream() == true) || PlaybackCacheManager.shouldBypassCache(uri, session)
+                        // Session scoped: another PlayerId's live state must never force an
+                        // unrelated VOD session to bypass the cache.
+                        PlaybackCacheManager.shouldBypassCache(uri, session)
                     },
                 )
             }

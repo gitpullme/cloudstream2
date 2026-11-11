@@ -203,10 +203,15 @@ class PlaybackPrefetchIntegrationTest {
         scheduler.enqueue(req)
         assertEquals(PrefetchRequest.Priority.SPECULATIVE, req.priority)
 
-        // Media3 requests this chunk
-        val inFlight = scheduler.onMedia3RequestStarting(identity)
-        assertNotNull(inFlight)
-        assertEquals(PrefetchRequest.Priority.IMMEDIATE, inFlight?.priority)
+        // Media3 requests this chunk. The handoff must never report a held lock, must record the
+        // key as owned by playback, and must not leave a prefetch writer able to fetch it again.
+        val handoff = scheduler.onMedia3RequestStarting(identity)
+        assertTrue("handoff must never report a held cache lock: $handoff", handoff !is CacheHandoffResult.LockStillHeld)
+        assertTrue("playback must own the cache key during its request", scheduler.isKeyInPlaybackUse(identity.cacheKey))
+        assertFalse(
+            "no prefetch writer may be active for a key playback is reading",
+            scheduler.isActivelyWritingKey(identity.cacheKey),
+        )
 
         scheduler.onMedia3RequestFinished(identity)
         scheduler.release()
@@ -609,7 +614,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wKey = CacheWriter(cacheDataSourceFactory.createDataSource(), keyReq.dataSpec, ByteArray(1024), null)
         wKey.cache()
-        CacheCoverageVerifier.markCompleted(keyReq.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(keyReq.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[keyReq.identity] = keyReq
         keyReq.status = PrefetchRequest.Status.COMPLETED
         coordinator.registerCompletedRequest(keyReq)
@@ -626,7 +631,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wVid = CacheWriter(cacheDataSourceFactory.createDataSource(), videoReq.dataSpec, ByteArray(1024), null)
         wVid.cache()
-        CacheCoverageVerifier.markCompleted(videoReq.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(videoReq.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[videoReq.identity] = videoReq
         videoReq.status = PrefetchRequest.Status.COMPLETED
         coordinator.registerCompletedRequest(videoReq)
@@ -643,7 +648,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wAud = CacheWriter(cacheDataSourceFactory.createDataSource(), audioReq.dataSpec, ByteArray(1024), null)
         wAud.cache()
-        CacheCoverageVerifier.markCompleted(audioReq.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(audioReq.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[audioReq.identity] = audioReq
         audioReq.status = PrefetchRequest.Status.COMPLETED
         coordinator.registerCompletedRequest(audioReq)
@@ -756,7 +761,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wV1 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqV1.dataSpec, ByteArray(1024), null)
         wV1.cache()
-        CacheCoverageVerifier.markCompleted(reqV1.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(reqV1.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[reqV1.identity] = reqV1
         coordinator.registerCompletedRequest(reqV1)
 
@@ -772,7 +777,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wV2 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqV2.dataSpec, ByteArray(1024), null)
         wV2.cache()
-        CacheCoverageVerifier.markCompleted(reqV2.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(reqV2.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[reqV2.identity] = reqV2
         coordinator.registerCompletedRequest(reqV2)
 
@@ -788,7 +793,7 @@ class PlaybackPrefetchIntegrationTest {
         )
         val wA1 = CacheWriter(cacheDataSourceFactory.createDataSource(), reqA1.dataSpec, ByteArray(1024), null)
         wA1.cache()
-        CacheCoverageVerifier.markCompleted(reqA1.identity.cacheKey)
+        CacheCoverageVerifier.markCompleted(reqA1.identity.cacheKey, cache = simpleCache)
         coordinator.scheduler.registry[reqA1.identity] = reqA1
         coordinator.registerCompletedRequest(reqA1)
 
@@ -1157,7 +1162,7 @@ class PlaybackPrefetchIntegrationTest {
             for (req in scheduled) {
                 val writer = CacheWriter(cacheDataSourceFactory.createDataSource(), req.dataSpec, ByteArray(1024), null)
                 writer.cache()
-                CacheCoverageVerifier.markCompleted(req.identity.cacheKey)
+                CacheCoverageVerifier.markCompleted(req.identity.cacheKey, cache = simpleCache)
                 coordinator.registerCompletedRequest(req)
             }
 
